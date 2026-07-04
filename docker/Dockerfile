@@ -17,7 +17,8 @@ RUN set -eux; \
         libnss3 libgbm1 libasound2 libxss1 \
         xz-utils \
         chromium \
-        xdotool xclip; \
+        xdotool xclip \
+        xwallpaper xsettingsd; \
     sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \
     locale-gen; \
     apt-get clean; \
@@ -51,6 +52,11 @@ RUN set -eux; \
         libdrm2; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
+
+# 预建 fontconfig 目录 + 用户字体目录 symlink（持久化到 /config/.fonts）
+RUN mkdir -p /home/abc/.config/fontconfig /config/.fonts /home/abc/.local/share && \
+    ln -sfn /config/.fonts /home/abc/.local/share/fonts && \
+    chown -R 1000:1000 /home/abc/.config /home/abc/.local
 
 ENV LANG=zh_CN.UTF-8 \
     LC_ALL=zh_CN.UTF-8 \
