@@ -75,6 +75,10 @@ const SHM_SIZE = 1024 * 1024 * 1024; // 1gb
 // 真实可用 GPU 想启用硬件编码：面板侧设 WOC_ENABLE_GPU=1，并让面板可见宿主 /dev/dri
 // （如同摄像头，把宿主 /dev 挂到 /host-dev，或设 WOC_DRI_DEVICES 显式指定）。
 const ENABLE_GPU = process.env.WOC_ENABLE_GPU === '1';
+// #134：宿主内核禁用 IPv6（ipv6.disable=1）时，实例 nginx 默认配置里的 `listen [::]` 绑定失败，整个 nginx 起不来，
+// 远程桌面随之全挂，用户只能进容器手动 sed。同一内核下所有容器看到的 /proc/net/if_inet6 一致：内核禁用 IPv6 时
+// 该文件不存在（普通 Docker 网络只是在容器内关 IPv6，文件仍在、[::] 仍可绑定，不受影响）。也可用 WOC_DISABLE_IPV6 强制。
+const NO_IPV6 = /^(1|true|yes)$/i.test(process.env.WOC_DISABLE_IPV6 || '') || !existsSync('/proc/net/if_inet6');
 
 // 可选：给每个实例容器设内存上限（GiB），作为 Xvnc 等异常增长时的兜底，避免拖垮宿主。
 // 默认 0 = 不限制（保持原行为）。命中上限时容器内 OOM 杀进程、由 s6 自动重启 VNC。
@@ -234,6 +238,8 @@ function envList(inst: Instance): string[] {
   // 微信等 Chromium 系应用即跟随系统深色）。开关由面板顶栏主题统一控制、持久化在 accounts.json，
   // 运行中的实例则通过 setInstanceDark 实时切换（见下）。
   if (getDesktopDark()) env.push('WOC_DARK=1');
+  // baseimage 的 init-nginx 只看 DISABLE_IPV6 是否已设置，设了就删掉 `listen [::]`（每次启动重新生成配置，故须常驻于容器环境）
+  if (NO_IPV6) env.push('DISABLE_IPV6=1');
   return env;
 }
 
