@@ -224,7 +224,7 @@ export const api = {
   panelLogUrl: (range: string) => `/api/admin/panel-log?range=${encodeURIComponent(range)}`,
 
   // 文件中转
-  listFiles: (id: string) => req<{ files: { name: string; size: number }[] }>(`/api/instances/${id}/files`),
+  listFiles: (id: string) => req<{ files: { name: string; size: number; mtime?: number }[] }>(`/api/instances/${id}/files`),
   uploadFile: async (id: string, file: File) => {
     const res = await fetch(`/api/instances/${id}/upload?name=${encodeURIComponent(file.name)}`, {
       method: 'POST',

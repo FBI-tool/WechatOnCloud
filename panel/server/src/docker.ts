@@ -995,7 +995,9 @@ function tarSingleFile(name: string, content: Buffer): Buffer {
   h.write('0001750\0', 108); // uid 1000(octal 1750)
   h.write('0001750\0', 116); // gid 1000
   h.write(content.length.toString(8).padStart(11, '0') + '\0', 124); // size
-  h.write('00000000000\0', 136); // mtime
+  // mtime 必须写当前时间：此前写死 0，上传进实例的文件全是 1970 年，
+  // 微信文件选择器、面板文件列表按时间排序时，刚上传的文件反而沉到最底下。
+  h.write(Math.floor(Date.now() / 1000).toString(8).padStart(11, '0') + '\0', 136); // mtime
   h.write('        ', 148); // checksum 占位（8 空格）
   h.write('0', 156); // typeflag 普通文件
   h.write('ustar\0', 257);
@@ -1016,7 +1018,7 @@ function tarEntry(name: string, content: Buffer): Buffer {
   h.write('0001750\0', 108);
   h.write('0001750\0', 116);
   h.write(content.length.toString(8).padStart(11, '0') + '\0', 124);
-  h.write('00000000000\0', 136);
+  h.write(Math.floor(Date.now() / 1000).toString(8).padStart(11, '0') + '\0', 136); // mtime（同 tarSingleFile，别写 0）
   h.write('        ', 148); // checksum 占位
   h.write('0', 156); // typeflag 普通文件
   h.write('ustar\0', 257);
@@ -1183,20 +1185,24 @@ export async function uploadToInstance(inst: Instance, name: string, content: Bu
 export interface TransferFile {
   name: string;
   size: number;
+  mtime: number; // 秒级 Unix 时间
 }
 export async function listInstanceFiles(inst: Instance): Promise<TransferFile[]> {
   const out = await execCapture(inst, [
     'sh',
     '-c',
-    `find ${TRANSFER_DIR} -maxdepth 1 -type f -printf '%f\\t%s\\n' 2>/dev/null`,
+    `find ${TRANSFER_DIR} -maxdepth 1 -type f -printf '%f\\t%s\\t%T@\\n' 2>/dev/null`,
   ]);
+  // 按修改时间倒序：最常见的用法是「刚在微信里另存到桌面 → 马上来下载」，最新的应在最上面。
+  // （此前是 find 的目录原始顺序，文件一多就得在乱序列表里找。）
   return out
     .split('\n')
     .filter(Boolean)
     .map((line) => {
-      const [name, size] = line.split('\t');
-      return { name, size: Number(size) || 0 };
-    });
+      const [name, size, mtime] = line.split('\t');
+      return { name, size: Number(size) || 0, mtime: Math.round(Number(mtime) || 0) };
+    })
+    .sort((a, b) => b.mtime - a.mtime || a.name.localeCompare(b.name));
 }
 
 export async function deleteInstanceFile(inst: Instance, name: string): Promise<void> {

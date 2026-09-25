@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, appProfile } from '../api';
 import { useUI } from '../ui';
@@ -148,17 +148,28 @@ function allowAutoRecover(iid: string): boolean {
 
 // 转发输入条上的功能键（issue #125）。键名走 xdotool，须匹配服务端白名单 /^[A-Za-z_]{1,20}$/，
 // 故只放单键、不放组合键（ctrl+a 这类含 "+" 会被拒）。
-const FUNC_KEYS: { key: string; label: string; title: string }[] = [
+// 方向键 / 回车用 SVG 而非 ↵ ← ↑ ↓ → 字符：字符的大小与基线随系统字体变化，安卓上 ↵ 小到几乎看不见、
+// 整排也会上下错位（issue #125 追评截图）。线条风格与侧栏图标一致（lucide 同款，MIT）。
+const KeyIcon = ({ d }: { d: string[] }) => (
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    {d.map((p) => (
+      <path key={p} d={p} />
+    ))}
+  </svg>
+);
+const ICON_ENTER = ['M9 10 4 15l5 5', 'M20 4v7a4 4 0 0 1-4 4H4'];
+const ICON_KEYBOARD = ['M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z', 'M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 13h.01M12 13h.01M16 13h.01M7 16h10'];
+const FUNC_KEYS: { key: string; label: ReactNode; title: string }[] = [
   { key: 'Escape', label: 'Esc', title: 'Escape（关弹窗/退出全屏输入）' },
   { key: 'Tab', label: 'Tab', title: 'Tab（切换焦点）' },
   // 用中文字面而非 ⌫（U+232B）：容器/部分系统缺字形会渲染成豆腐块，实测就是方框
   { key: 'BackSpace', label: '退格', title: '退格（删除前一个字符）' },
   { key: 'Delete', label: 'Del', title: 'Delete（删除后一个字符）' },
-  { key: 'Return', label: '↵', title: '回车（发送/换行）' },
-  { key: 'Left', label: '←', title: '左方向键' },
-  { key: 'Up', label: '↑', title: '上方向键' },
-  { key: 'Down', label: '↓', title: '下方向键' },
-  { key: 'Right', label: '→', title: '右方向键' },
+  { key: 'Return', label: <KeyIcon d={ICON_ENTER} />, title: '回车（发送/换行）' },
+  { key: 'Left', label: <KeyIcon d={['m12 19-7-7 7-7', 'M19 12H5']} />, title: '左方向键' },
+  { key: 'Up', label: <KeyIcon d={['m5 12 7-7 7 7', 'M12 19V5']} />, title: '上方向键' },
+  { key: 'Down', label: <KeyIcon d={['M12 5v14', 'm19 12-7 7-7-7']} />, title: '下方向键' },
+  { key: 'Right', label: <KeyIcon d={['M5 12h14', 'm12 5 7 7-7 7']} />, title: '右方向键' },
 ];
 
 const MenuIcon = (
@@ -1298,7 +1309,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               {showKeys && (
                 <div className="iv-keybar">
                   {FUNC_KEYS.map((k) => (
-                    <button key={k.key} className="iv-key" title={k.title} onClick={() => pressKey(k.key)}>
+                    <button key={k.key} className="iv-key" title={k.title} aria-label={k.title} onClick={() => pressKey(k.key)}>
                       {k.label}
                     </button>
                   ))}
@@ -1308,9 +1319,11 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 <button
                   className={'iv-imebar-tool' + (showKeys ? ' on' : '')}
                   title="功能键（Esc / Tab / 退格 / 方向键…）"
+                  aria-label="功能键"
+                  aria-pressed={showKeys}
                   onClick={() => setShowKeys((v) => !v)}
                 >
-                  Fn
+                  <KeyIcon d={ICON_KEYBOARD} />
                 </button>
                 <textarea
                   className="iv-imebar-input"
@@ -1336,9 +1349,11 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                       ? '自动回车：开。文字送到应用后立刻回车发出。点击关闭（只填字不发送，便于先编辑再发）'
                       : '自动回车：关。只把文字填进应用输入框，发送由你自己按。点击开启'
                   }
+                  aria-label="自动回车"
+                  aria-pressed={autoEnter}
                   onClick={toggleAutoEnter}
                 >
-                  ↵
+                  <KeyIcon d={ICON_ENTER} />
                 </button>
                 <button
                   className="btn btn-primary iv-imebar-send"
