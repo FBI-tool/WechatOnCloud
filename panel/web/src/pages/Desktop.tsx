@@ -98,11 +98,24 @@ function humanSize(n: number) {
 // KasmVNC/noVNC 客户端 bundle 偶发未捕获异常（实测长时间空闲后报 "Cannot read properties of undefined
 // (reading 'lastActiveAt')"），会弹出其致命错误浮层（#noVNC_fallback_error 加 .noVNC_open）并卡死桌面，
 // 此时底层 ws 已死、自带重连也救不回。返回错误文案以便记日志；无致命错误则返回 null。
-function fatalErrorMsg(doc: Document | null | undefined): string | null {
+//
+// ⚠️ 浏览器扩展误报：KasmVNC 的全局 error / unhandledrejection 处理器会把页面上【任何】未捕获错误都当致命错误
+// 弹浮层——包括浏览器扩展注入到页面主世界的脚本抛的错（MetaMask 等钱包扩展会往每个页面注入 inpage.js，
+// 连不上时抛 "Failed to connect to MetaMask"）。这类错误与远程桌面无关（此时 VNC 仍是 connected），若据此重载，
+// 装了这类扩展的用户桌面会每十几秒被我们自己的自愈逻辑重载一次（实测 MetaMask：约 13s 一次，#122 同型）。
+// 浮层里带完整堆栈，据扩展协议地址即可区分：扩展错误只关掉浮层、不重载；KasmVNC 自身的崩溃照旧自愈。
+const EXTENSION_SRC = /\b(?:chrome|moz|safari(?:-web)?|ms-browser)-extension:\/\//i;
+function fatalErrorMsg(doc: Document | null | undefined, onExtensionError?: (msg: string) => void): string | null {
   try {
     const el = doc?.getElementById('noVNC_fallback_error');
     if (el && el.classList.contains('noVNC_open')) {
-      return doc?.getElementById('noVNC_fallback_errormsg')?.textContent?.trim() || 'KasmVNC 致命错误';
+      const msg = doc?.getElementById('noVNC_fallback_errormsg')?.textContent?.trim() || 'KasmVNC 致命错误';
+      if (EXTENSION_SRC.test(msg)) {
+        el.classList.remove('noVNC_open'); // 关掉误报浮层，桌面照常用
+        onExtensionError?.(msg);
+        return null;
+      }
+      return msg;
     }
   } catch {
     /* 同源正常不会到这 */
@@ -263,6 +276,13 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const lastBeat = useRef(0);
   const audioRef = useRef<VncAudio | null>(null);
   const recovering = useRef(false); // 致命崩溃自愈进行中（防错误浮层轮询与 error 事件重复触发重载）
+  // 浏览器扩展注入脚本的报错（见 fatalErrorMsg）：只关浮层不重连；每次页面加载只记一条，避免 3s 轮询刷日志
+  const extErrLogged = useRef(false);
+  const onExtensionError = (msg: string) => {
+    if (extErrLogged.current || !id) return;
+    extErrLogged.current = true;
+    api.clientLog(id, `忽略浏览器扩展注入脚本的报错（非桌面故障，不重连）：${msg.slice(0, 160)}`);
+  };
 
   const inst = instances.find((i) => i.id === id);
   const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Chromium…）
@@ -543,7 +563,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     let lastState = '';
     const t = window.setInterval(() => {
       const doc = frameRef.current?.contentDocument;
-      const fatal = fatalErrorMsg(doc);
+      const fatal = fatalErrorMsg(doc, onExtensionError);
       if (fatal) {
         recoverFromFatal(fatal);
         return;
@@ -581,18 +601,21 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!win) return;
     const onErr = () => {
       window.setTimeout(() => {
-        const msg = fatalErrorMsg(frameRef.current?.contentDocument);
+        const msg = fatalErrorMsg(frameRef.current?.contentDocument, onExtensionError);
         if (msg) recoverFromFatal(msg);
       }, 400);
     };
     try {
       win.addEventListener('error', onErr);
+      // KasmVNC 对 Promise 未处理拒绝也会弹同一个浮层（扩展报错多走这条），一并快速处理，免得浮层挂满 3s 轮询间隔
+      win.addEventListener('unhandledrejection', onErr);
     } catch {
       return;
     }
     return () => {
       try {
         win.removeEventListener('error', onErr);
+        win.removeEventListener('unhandledrejection', onErr);
       } catch {
         /* ignore */
       }
