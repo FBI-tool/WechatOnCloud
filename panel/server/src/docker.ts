@@ -287,6 +287,100 @@ function fallbackLatestRef(): string | null {
   return `${m[1]}:latest`;
 }
 
+// ---------- 自定义数据目录 WOC_DATA_ROOT（#133 #127，取代 PR #69 的做法） ----------
+// 需求：实例数据（聊天记录、收到的文件）落到用户自选的宿主目录（大容量盘 / 方便直接取文件），
+// 而不是 Docker 默认的卷目录。PR #69 直接把 /config 改绑宿主路径，会让已有实例切到空目录（看似丢数据），
+// 且面板里按卷名工作的功能（数据卷浏览/备份/恢复/孤儿卷清理）全部失效。
+// 这里改用 local 驱动的「绑定型具名卷」：卷名不变、内容在宿主目录，其余功能原样可用；
+// 且只在新建实例（卷尚不存在）时生效——已存在的卷一律不碰，老实例零影响，事后取消该设置也不影响已建实例。
+function parseDataRoot(raw: string | undefined): string {
+  const v = (raw || '').trim().replace(/\/+$/, '');
+  if (!v) return '';
+  // 只接受干净的绝对路径：会被拼进辅助容器的 shell 命令与卷的 device 参数
+  if (!/^\/[A-Za-z0-9._\-\/]+$/.test(v) || v.split('/').includes('..')) {
+    console.error(`[data-root] 忽略非法的 WOC_DATA_ROOT：${v}（需为不含空格与 .. 的宿主绝对路径）`);
+    return '';
+  }
+  return v;
+}
+const DATA_ROOT = parseDataRoot(process.env.WOC_DATA_ROOT);
+const VOLUME_NAME_RE = /^woc-data-[0-9a-z]+$/;
+const SAFE_ID = (v: string) => (/^\d+$/.test(v) ? v : '1000');
+
+// 以 root 跑一次性辅助容器，把宿主 root 目录挂到 /woc-root 执行一段脚本（面板容器本身看不到宿主路径）
+async function runDataRootHelper(root: string, image: string, script: string): Promise<void> {
+  const c = await docker.createContainer({
+    Image: image,
+    Entrypoint: ['sh', '-c'],
+    Cmd: [script],
+    User: '0',
+    Labels: { 'woc.helper': 'data-root' },
+    HostConfig: { Binds: [`${root}:/woc-root`] },
+  } as any);
+  try {
+    await c.start();
+    const r: any = await c.wait();
+    if (r?.StatusCode !== 0) throw new Error(`辅助容器退出码 ${r?.StatusCode}`);
+  } finally {
+    await c.remove({ force: true }).catch(() => {});
+  }
+}
+
+async function ensureInstanceVolume(inst: Instance, image: string): Promise<void> {
+  if (!DATA_ROOT || !VOLUME_NAME_RE.test(inst.volumeName)) return;
+  try {
+    await docker.getVolume(inst.volumeName).inspect();
+    return; // 卷已存在（老实例 / 重启 / 自愈）：绝不改动
+  } catch {
+    /* 不存在 → 按 WOC_DATA_ROOT 新建 */
+  }
+  const dir = `${DATA_ROOT}/${inst.volumeName}`;
+  await runDataRootHelper(
+    DATA_ROOT,
+    image,
+    `mkdir -p /woc-root/${inst.volumeName} && chown ${SAFE_ID(PUID)}:${SAFE_ID(PGID)} /woc-root/${inst.volumeName}`,
+  );
+  await docker.createVolume({
+    Name: inst.volumeName,
+    Driver: 'local',
+    DriverOpts: { type: 'none', o: 'bind', device: dir },
+    Labels: { 'woc.data-root': DATA_ROOT },
+  } as any);
+  appendInstanceLog(inst.id, `数据目录：宿主 ${dir}（WOC_DATA_ROOT）`);
+  appendPanelLog('INFO', `实例 ${inst.id} 的数据目录建在宿主 ${dir}`);
+}
+
+// 删除数据卷；若是 WOC_DATA_ROOT 建的绑定型卷，宿主目录一并删除（「清除数据」的本意），
+// 否则删卷只是去掉 Docker 里的卷对象，数据会以用户看不见的形式留在宿主上。
+async function removeVolumeWithData(name: string): Promise<void> {
+  let root = '';
+  try {
+    const info: any = await docker.getVolume(name).inspect();
+    root = parseDataRoot(info?.Labels?.['woc.data-root']);
+  } catch {
+    /* 卷不存在 */
+  }
+  await docker.getVolume(name).remove({ force: true } as any);
+  if (!root || !VOLUME_NAME_RE.test(name)) return;
+  try {
+    await runDataRootHelper(root, WECHAT_IMAGE, `rm -rf /woc-root/${name}`);
+    appendPanelLog('INFO', `已删除宿主数据目录 ${root}/${name}`);
+  } catch (e: any) {
+    appendPanelLog('WARN', `宿主数据目录 ${root}/${name} 未能自动删除（${e?.message || e}），可手动删除`);
+  }
+}
+
+// 诊断用：说明数据实际落在哪里
+export async function describeInstanceVolume(name: string): Promise<string> {
+  try {
+    const info: any = await docker.getVolume(name).inspect();
+    const dev = info?.Options?.device;
+    return info?.Options?.o === 'bind' && dev ? `宿主目录 ${dev}` : `Docker 卷 ${info?.Mountpoint || ''}`.trim();
+  } catch {
+    return '卷尚不存在';
+  }
+}
+
 // 创建并启动一个微信实例容器。若同名容器已存在则先移除（仅容器，不动卷）。
 // keepImage（稳定性关键）：重启/自愈必须幂等——沿用该实例当前正在跑的镜像重建，
 // 绝不因"本地 :latest 恰好被某次拉取更新过"就悄悄换镜像（那等于一次没人要求的隐式升级；
@@ -308,6 +402,7 @@ export async function runInstance(inst: Instance, opts?: { keepImage?: boolean }
   // 沿用旧镜像重建时无需 ensureImage（镜像 id 一定在本地——容器刚在用它）；
   // 也避免"离线 + 本地无 :latest"时连重启都失败。
   if (!imageOverride) await ensureImage();
+  await ensureInstanceVolume(inst, imageOverride || WECHAT_IMAGE);
   // 摄像头设备（探测不到则为空数组 → 仅摄像头不可用，音频/麦克风照常）
   const vids = videoDevices();
   const dris = ENABLE_GPU ? driDevices() : [];
@@ -546,7 +641,7 @@ export async function removeInstance(inst: Instance, purgeVolume: boolean): Prom
   }
   if (purgeVolume) {
     try {
-      await docker.getVolume(inst.volumeName).remove({ force: true } as any);
+      await removeVolumeWithData(inst.volumeName);
     } catch {
       /* 卷可能不存在 */
     }
@@ -586,7 +681,7 @@ export async function listOrphanVolumes(referencedVolumes: Set<string>): Promise
 
 // 显式删除一个数据卷（管理员清理孤儿卷用）。调用方负责确认它不被现存实例引用。
 export async function removeVolume(name: string): Promise<void> {
-  await docker.getVolume(name).remove({ force: true } as any);
+  await removeVolumeWithData(name);
 }
 
 // 列出"残留的 woc-wx-* 容器"：在 docker 里存在但 store 没登记的（多为 runInstance 失败时
@@ -1102,7 +1197,7 @@ export async function buildDiagnostics(instances: Instance[], sinceMs: number, m
 
   // 每个实例
   for (const inst of instances) {
-    let c = `实例: ${inst.name}\nID: ${inst.id}\n容器: ${inst.containerName}\n类型: ${instanceAppType(inst)}\n数据卷: ${inst.volumeName}\n创建: ${inst.createdAt}\n\n`;
+    let c = `实例: ${inst.name}\nID: ${inst.id}\n容器: ${inst.containerName}\n类型: ${instanceAppType(inst)}\n数据卷: ${inst.volumeName}（${await describeInstanceVolume(inst.volumeName)}）\n创建: ${inst.createdAt}\n\n`;
     try {
       const info: any = await docker.getContainer(inst.containerName).inspect();
       const s = info.State || {};
