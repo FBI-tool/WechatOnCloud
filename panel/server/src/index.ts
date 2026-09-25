@@ -64,6 +64,7 @@ import {
   buildDiagnostics,
   typeInInstance,
   keyInInstance,
+  pasteImageInInstance,
   listOrphanVolumes,
   removeVolume,
   listOrphanContainers,
@@ -933,6 +934,23 @@ app.post('/api/instances/:id/type', async (req, reply) => {
 });
 
 // 模拟单个按键（无感输入模式下按序送出被截下的回车/退格，保证与中文转发的顺序）
+// 本机剪贴板图片直接粘进应用（issue #91）：前端在 paste 事件里拿到图片后上传到这里
+app.post('/api/instances/:id/paste-image', { bodyLimit: 64 * 1024 * 1024 }, async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const mime = String((req.query as any)?.type || '').toLowerCase();
+  const body = req.body as Buffer;
+  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空图片' });
+  try {
+    await pasteImageInInstance(findInstance(id)!, mime, body);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '粘贴图片失败' });
+  }
+});
+
 app.post('/api/instances/:id/key', async (req, reply) => {
   const u = requireAuth(req, reply);
   if (!u) return;

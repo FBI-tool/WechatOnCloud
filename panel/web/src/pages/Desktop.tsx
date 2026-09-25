@@ -84,6 +84,89 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
   };
 }
 
+// 本机截图 / 图片直接粘进应用（issue #91，多人反馈）。
+// 背景：noVNC 在 keydown 里 preventDefault，浏览器的粘贴动作连同 paste 事件都被压掉，本机的图片永远到不了容器。
+// 做法：抢在 noVNC 之前截下 Ctrl/Cmd+V（只 stopImmediatePropagation，不 preventDefault），让浏览器照常派发
+// 带剪贴板数据的 paste 事件——它不依赖异步剪贴板 API，内网 http 访问下同样可用。实测 paste 在按键后同一任务内
+// 到达（约 4ms），早于 setTimeout(0)，所以在定时器里决定走哪条路：
+//   - 本机剪贴板有图片、且它比容器剪贴板「新」→ 上传写入容器 X 剪贴板并在容器里按 Ctrl+V（onImage）
+//   - 其余情况 → 在容器里按一次 Ctrl+V（onPlainPaste），粘贴的仍是容器剪贴板，与以前完全一致
+//     （例如在微信里复制一条消息再粘到别处——这条最常用的路径不能被改变）
+// 不能把截下的按键「合成事件」还给 noVNC：实测按键松开得快时，重放时修饰键已抬起，远端只收到一个 v。
+// 改由服务端 xdotool --clearmodifiers 按 Ctrl+V，与用户按多久无关。
+//
+// 「谁更新」：本机剪贴板里可能躺着很久以前的截图，而用户刚在微信里复制了一张图——此时应粘容器的。
+// 回到页面（focus）视为可能刚在外面复制/截图 → 本机为新；在桌面里 Ctrl/Cmd+C、X 或右键（微信里复制）→ 容器为新。
+// 但有些截图方式不让浏览器失焦（如 macOS 自带截图），只靠 focus 会把新截图误判为旧的——所以再看图片本身：
+// 和上次见过的不是同一张（类型+字节数不同）就一定是本机新产生的，照粘本机；同一张且其后在应用里复制过，才改粘容器。
+function installPasteBridge(
+  win: Window,
+  doc: Document,
+  topWin: Window,
+  handlers: { onImage: (file: File) => void; onPlainPaste: () => void },
+): () => void {
+  type Pending = { handled: boolean };
+  let pending: Pending | null = null;
+  let localIsFresh = true;
+  let lastLocalImage = ''; // 上次在 paste 里见到的本机图片签名
+  const isKey = (e: KeyboardEvent, code: string, key: string) =>
+    (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.code === code || e.key.toLowerCase() === key);
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (!e.isTrusted || e.isComposing) return;
+    if (isKey(e, 'KeyC', 'c') || isKey(e, 'KeyX', 'x')) {
+      localIsFresh = false; // 在应用里复制/剪切 → 容器剪贴板更新（按键照常交给 noVNC）
+      return;
+    }
+    if (e.repeat || !isKey(e, 'KeyV', 'v')) return;
+    e.stopImmediatePropagation();
+    const p: Pending = { handled: false };
+    pending = p;
+    win.setTimeout(() => {
+      if (pending === p) pending = null;
+      if (!p.handled) handlers.onPlainPaste();
+    }, 0);
+  };
+
+  const onPaste = (e: ClipboardEvent) => {
+    // 由我们截下的 Ctrl/Cmd+V 引起的粘贴：一律阻止浏览器默认插入，粘什么只由我们决定。
+    // 否则无感模式下焦点在 KasmVNC 的输入框（noVNC_keyboardinput），浏览器会把本机剪贴板文字原样插进去，
+    // KasmVNC 再把它当键入发给远端——既改变了粘贴语义，还会把本机剪贴板里的敏感内容打进应用（实测发生过）。
+    if (pending) e.preventDefault();
+    const item = Array.from(e.clipboardData?.items || []).find((i) => i.kind === 'file' && i.type.startsWith('image/'));
+    const file = item?.getAsFile();
+    if (!file) return;
+    const sig = `${file.type}:${file.size}`;
+    const isNewImage = sig !== lastLocalImage;
+    lastLocalImage = sig;
+    if (!localIsFresh && !isNewImage) return; // 同一张旧图、之后在应用里复制过 → 让定时器粘容器剪贴板
+    localIsFresh = true;
+    e.preventDefault();
+    if (pending) pending.handled = true;
+    handlers.onImage(file);
+  };
+
+  const onFocus = () => {
+    localIsFresh = true;
+  };
+  const onMouseDown = (e: MouseEvent) => {
+    if (e.button === 2) localIsFresh = false; // 右键菜单多半是在应用里「复制」
+  };
+
+  win.addEventListener('keydown', onKeyDown, true);
+  doc.addEventListener('paste', onPaste, true);
+  win.addEventListener('mousedown', onMouseDown, true);
+  topWin.addEventListener('focus', onFocus);
+  win.addEventListener('focus', onFocus);
+  return () => {
+    win.removeEventListener('keydown', onKeyDown, true);
+    doc.removeEventListener('paste', onPaste, true);
+    win.removeEventListener('mousedown', onMouseDown, true);
+    topWin.removeEventListener('focus', onFocus);
+    win.removeEventListener('focus', onFocus);
+  };
+}
+
 interface TFile {
   name: string;
   size: number;
@@ -481,6 +564,32 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       /* 隐私模式等禁用 localStorage：忽略 */
     }
   }, [id, inputMode]);
+
+  // 本机图片粘贴桥（issue #91）：两种输入模式都生效
+  const pastingImage = useRef(false);
+  useEffect(() => {
+    if (!showVnc || !frameLoaded || !id) return;
+    const win = frameRef.current?.contentWindow;
+    const doc = frameRef.current?.contentDocument;
+    if (!win || !doc) return;
+    return installPasteBridge(win, doc, window, {
+      onImage: async (file) => {
+        if (pastingImage.current) return;
+        pastingImage.current = true;
+        toast('正在粘贴本机图片…', 'ok');
+        try {
+          await api.pasteImage(id, file);
+        } catch (e: any) {
+          toast(e?.message || '粘贴图片失败：请确认实例已「升级实例」', 'error');
+        } finally {
+          pastingImage.current = false;
+        }
+      },
+      // 粘贴容器剪贴板：失败时静默（与以前按键直通 noVNC 一样，不额外打扰）
+      onPlainPaste: () => void api.keyInInstance(id, 'ctrl+v').catch(() => {}),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showVnc, frameLoaded, id]);
 
   // 无感模式：往同源 iframe 装「中文转发 + 有序队列」钩子；切回转发/重连/卸载时自动移除。
   useEffect(() => {

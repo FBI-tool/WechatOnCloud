@@ -1296,11 +1296,42 @@ export async function typeInInstance(inst: Instance, text: string): Promise<void
   await execCapture(inst, ['bash', '-c', cmd]);
 }
 
+// 把本机剪贴板里的图片（截图等）粘进应用（issue #91）：写入容器的 X 剪贴板（目标类型即图片 MIME），
+// 再按一次 Ctrl+V，效果等同于在容器里复制了一张图片后粘贴。图片先落到 /tmp（非持久卷，重启即清），
+// xclip -i 读完文件后会常驻持有剪贴板选区，文件本身随后即可删除；这里顺手清掉 10 分钟前的旧文件。
+const PASTE_IMAGE_TYPES: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/bmp': 'bmp',
+};
+export async function pasteImageInInstance(inst: Instance, mime: string, content: Buffer): Promise<void> {
+  const ext = PASTE_IMAGE_TYPES[mime];
+  if (!ext) throw new Error('不支持的图片类型');
+  const name = `woc-paste-${Date.now()}.${ext}`;
+  await docker.getContainer(inst.containerName).putArchive(tarSingleFile(name, content), { path: '/tmp' });
+  const cmd = [
+    'set -e',
+    'display="${DISPLAY:-}"',
+    'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
+    'export DISPLAY="${display:-:1}"',
+    'command -v xclip >/dev/null 2>&1 || { echo "xclip not installed in instance image" >&2; exit 127; }',
+    'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+    "find /tmp -maxdepth 1 -name 'woc-paste-*' -mmin +10 -delete 2>/dev/null || true",
+    // 同 typeInInstance：xclip 常驻后台持有选区，必须重定向 fd，否则 docker exec 要等它退出（~2s）
+    `xclip -selection clipboard -t ${mime} -i /tmp/${name} >/dev/null 2>&1`,
+    'xdotool key --clearmodifiers ctrl+v',
+  ].join('; ');
+  await execCapture(inst, ['bash', '-c', cmd]);
+}
+
 // 通过 xdotool 在实例容器内模拟一次按键（如 Return / BackSpace）。
 // 用于「无感输入」模式：中文经 xclip 转发期间，把被截下的回车/退格按序送出，保证顺序、避免抢跑。
-// key 仅允许字母与下划线（xdotool keysym 名），杜绝注入。
+// key 为 xdotool keysym 名，可带至多 3 个修饰键前缀（如 ctrl+v、ctrl+shift+Tab）；
+// 只允许字母 / 下划线 / 固定修饰键名与 "+"，杜绝 shell 注入。
 export async function keyInInstance(inst: Instance, key: string): Promise<void> {
-  if (!/^[A-Za-z_]{1,20}$/.test(key)) throw new Error('按键名不合法');
+  if (!/^(?:(?:ctrl|shift|alt|super)\+){0,3}[A-Za-z_]{1,20}$/.test(key)) throw new Error('按键名不合法');
   const cmd = [
     'set -e',
     'display="${DISPLAY:-}"',

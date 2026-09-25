@@ -271,6 +271,17 @@ export const api = {
     if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as any).error || '上传失败');
     return res.json();
   },
+  // 本机剪贴板图片 → 容器 X 剪贴板 → Ctrl+V（issue #91）
+  pasteImage: async (id: string, file: Blob) => {
+    const res = await apiFetch(`/api/instances/${id}/paste-image?type=${encodeURIComponent(file.type)}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: file,
+    });
+    if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as any).error || '粘贴图片失败');
+    return res.json();
+  },
   downloadFileUrl: (id: string, name: string) => `/api/instances/${id}/download?name=${encodeURIComponent(name)}`,
   deleteFile: (id: string, name: string) => req(`/api/instances/${id}/files?name=${encodeURIComponent(name)}`, { method: 'DELETE' }),
 
