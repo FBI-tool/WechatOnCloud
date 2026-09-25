@@ -1050,7 +1050,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         </button>
         <span className="ws-title">{title}</span>
         {showVnc && (
-          <>
+          // 操作按钮收进可横向滑动的容器：手机宽度放不下时在容器内滑动，而不是整排挤出屏幕
+          //（此前 390px 宽时「桌面」「重启」完全在屏幕外点不到，标题也被压成 0 宽）
+          <div className="ws-actions">
             <button
               className="ws-action"
               title="文件传输"
@@ -1109,7 +1111,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 </button>
               </>
             )}
-          </>
+          </div>
         )}
       </header>
 
