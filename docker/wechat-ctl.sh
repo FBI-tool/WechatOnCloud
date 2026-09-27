@@ -144,10 +144,14 @@ do_install() {
   # 断点续传下载（-C -）：网络半路中断/被中间设备掐断时，下次从已下字节【继续】而非从 0 重来
   #（这正是"反复卡在同一百分比退出"的解药）。--retry-all-errors 对传输中断也重试；外层再多轮兜底。
   # 关键：绝不在重试前删 $tmp —— 保留部分文件才能续传。
+  # --speed-limit/--speed-time：60 秒内平均不到 1KB/s 即判定卡住并中断、按续传重试。连接还在但数据不再来
+  #（中间设备半开、CDN 节点僵住）时 curl 否则会一直挂着：进度永远停在某个百分比，面板在「下载中」又收起了
+  # 卡片上的全部按钮，删不掉也重启不了（#99）。
   while [ "$attempt" -lt 6 ]; do
     attempt=$((attempt+1))
     for base in "$CDN_MAIN" "$CDN_FALLBACK"; do
       curl -fSL -C - --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 \
+           --speed-limit 1024 --speed-time 60 \
            -A "$UA" -o "$tmp" "$base/$file" & pid=$!
       while kill -0 "$pid" 2>/dev/null; do
         if [ "${total:-0}" -gt 0 ] 2>/dev/null; then

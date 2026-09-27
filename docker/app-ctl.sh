@@ -62,7 +62,9 @@ install_telegram() {
   tmp="$work/tg.tar.xz"
   rm -rf "$work"; mkdir -p "$work"
   write_status downloading -1 "正在下载 Telegram"
-  if ! curl -fSL --retry 3 --connect-timeout 20 -A "Mozilla/5.0" -o "$tmp" "https://telegram.org/dl/desktop/linux"; then
+  # 60 秒内平均不到 1KB/s 即中断（同 wechat-ctl.sh，#99）：否则连接僵住时永远停在「下载中」、卡片按钮全被收起
+  if ! curl -fSL --retry 3 --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+       -A "Mozilla/5.0" -o "$tmp" "https://telegram.org/dl/desktop/linux"; then
     write_status error 0 "下载失败，请检查网络后重试"; rm -rf "$work"; return
   fi
   write_status extracting 92 "正在解压安装"
