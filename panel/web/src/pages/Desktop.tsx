@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, appProfile } from '../api';
 import { useUI } from '../ui';
@@ -759,23 +759,29 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     };
   }, [showVnc, id]);
 
-  // 用户在 VNC 内真实操作（鼠标/键盘/滚轮）时续约控制权（同源 iframe 可监听）。节流 2.5s。
-  // 只读用户的操作已被遮罩拦截/失焦，不会误续约；空闲不操作则超时自动释放。
+  // 续约控制权，节流 2.5s。桌面画面里的真实操作、底部输入条里打字都算（输入条不经过画面，此前不续约，
+  // 连着打一会儿字控制权就被别人拿走）。空闲不操作则超时自动释放。
+  const beat = useCallback(async () => {
+    if (!id) return;
+    const now = Date.now();
+    if (now - lastBeat.current < 2500) return;
+    lastBeat.current = now;
+    try {
+      const r = await api.controlBeat(id);
+      setControl({ free: false, mine: r.mine, holder: r.holder });
+    } catch {
+      /* ignore */
+    }
+  }, [id]);
+  const readOnly = !!control && !control.free && !control.mine; // 别人在操作：只读
+
+  // 用户在 VNC 内真实操作（鼠标/键盘/滚轮）时续约控制权（同源 iframe 可监听）。
+  // 只读用户的操作已被遮罩拦截/失焦，不会误续约。
   useEffect(() => {
     if (!showVnc || !id || !frameLoaded) return;
     const win = frameRef.current?.contentWindow;
     if (!win) return;
-    const onInteract = async () => {
-      const now = Date.now();
-      if (now - lastBeat.current < 2500) return;
-      lastBeat.current = now;
-      try {
-        const r = await api.controlBeat(id);
-        setControl({ free: false, mine: r.mine, holder: r.holder });
-      } catch {
-        /* ignore */
-      }
-    };
+    const onInteract = () => void beat();
     const evs = ['mousedown', 'keydown', 'wheel'] as const;
     try {
       evs.forEach((e) => win.addEventListener(e, onInteract, { capture: true, passive: true }));
@@ -789,7 +795,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         /* ignore */
       }
     };
-  }, [showVnc, id, frameLoaded, frameGen]);
+  }, [showVnc, id, frameLoaded, frameGen, beat]);
 
   // 进入/重连桌面前，按输入模式设 KasmVNC 的 enable_ime（iframe 同源共享 localStorage，加载前设好即生效）。
   //   无感（seamless）：enable_ime=true，启用 noVNC 合成 textarea；中文 keysym 已被容器补丁抑制，
@@ -862,7 +868,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       (e) => {
         if (Date.now() - lastFailToast < 5000) return;
         lastFailToast = Date.now();
-        toast(`刚输入的文字没能发送到桌面：${e?.message || '网络或实例暂时不可用'}，请重试`, 'error');
+        const msg = e?.message || '';
+        // 别人持有控制权（409）时直接说清楚；其余是网络 / 实例问题
+        toast(/正在操作/.test(msg) ? msg : `刚输入的文字没能发送到桌面：${msg || '网络或实例暂时不可用'}，请重试`, 'error');
       },
     );
     return cleanup;
@@ -1722,7 +1730,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               {showKeys && (
                 <div className="iv-keybar">
                   {FUNC_KEYS.map((k) => (
-                    <button key={k.key} className="iv-key" title={k.title} aria-label={k.title} onClick={() => pressKey(k.key)}>
+                    <button key={k.key} className="iv-key" title={k.title} aria-label={k.title} disabled={readOnly} onClick={() => pressKey(k.key)}>
                       {k.label}
                     </button>
                   ))}
@@ -1741,17 +1749,21 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 <textarea
                   className="iv-imebar-input"
                   value={imeText}
+                  disabled={readOnly}
                   onChange={(e) => setImeText(e.target.value)}
                   onKeyDown={(e) => {
+                    void beat();
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
                       sendImeText();
                     }
                   }}
                   placeholder={
-                    autoEnter
-                      ? '中文输入这里 → 回车直接发送到应用（先点好应用的输入框）。Shift+回车换行。'
-                      : '中文输入这里 → 回车只把文字填进应用输入框，不自动发送（发送由你按）。Shift+回车换行。'
+                    readOnly
+                      ? `「${control?.holder}」正在操作，你当前为只读；要操作请点桌面上的「申请控制」`
+                      : autoEnter
+                        ? '中文输入这里 → 回车直接发送到应用（先点好应用的输入框）。Shift+回车换行。'
+                        : '中文输入这里 → 回车只把文字填进应用输入框，不自动发送（发送由你按）。Shift+回车换行。'
                   }
                   rows={1}
                 />
@@ -1770,7 +1782,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 </button>
                 <button
                   className="btn btn-primary iv-imebar-send"
-                  disabled={imeSending || !imeText.trim()}
+                  disabled={imeSending || !imeText.trim() || readOnly}
                   onClick={sendImeText}
                 >
                   {imeSending ? '发送中' : autoEnter ? '发送' : '填入'}

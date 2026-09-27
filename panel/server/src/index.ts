@@ -1014,6 +1014,19 @@ app.post('/api/instances/:id/control/take', async (req, reply) => {
   return { mine: true, holder: u.username };
 });
 
+// 输入类接口（/type、/key、/paste-text、/paste-image）同样受控制权约束：此前只在前端盖只读遮罩，只读的一方
+// 仍能用底部输入条、功能键、粘贴把字送进去，和正在操作的人打架。别人持有（TTL 内）就拒绝；否则视同一次操作，
+// 认领 / 续约——转发输入条打字不经过桌面画面，此前不续约，连着打一会儿字控制权就被别人拿走了。
+// 这是协作上的防打架，不是用户之间的安全边界（有访问权限的人本就能直接操作桌面）。
+function claimControl(u: User, id: string): string | null {
+  const now = Date.now();
+  const h = controlHolders.get(id);
+  if (h && h.userId !== u.id && now - h.at <= CONTROL_TTL) return h.username;
+  controlHolders.set(id, { userId: u.id, username: u.username, at: now });
+  return null;
+}
+const controlBusy = (holder: string) => ({ error: `「${holder}」正在操作，你当前为只读；要操作请先点「申请控制」`, holder });
+
 // 通过 xdotool 在实例容器内输入文字（绕过 VNC XKB keysym 容量限制，修复中文 IME 吞字）
 app.post('/api/instances/:id/type', async (req, reply) => {
   const u = requireAuth(req, reply);
@@ -1022,6 +1035,8 @@ app.post('/api/instances/:id/type', async (req, reply) => {
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
   const { text } = (req.body as any) ?? {};
   if (!text || typeof text !== 'string' || text.length > 500) return reply.code(400).send({ error: '文字为空或过长' });
+  const holder = claimControl(u, id);
+  if (holder) return reply.code(409).send(controlBusy(holder));
   try {
     await typeInInstance(findInstance(id)!, text);
     return { ok: true };
@@ -1040,6 +1055,8 @@ app.post('/api/instances/:id/paste-image', async (req, reply) => {
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
   const inst = findInstance(id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  const holder = claimControl(u, id);
+  if (holder) return reply.code(409).send(controlBusy(holder));
   const mime = String((req.query as any)?.type || '').toLowerCase();
   try {
     const body = await readBody(req, 64 * MiB);
@@ -1060,6 +1077,8 @@ app.post('/api/instances/:id/paste-text', { bodyLimit: 2 * 1024 * 1024 }, async 
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
   const { text } = (req.body as any) ?? {};
   if (!text || typeof text !== 'string' || text.length > 200_000) return reply.code(400).send({ error: '文字为空或过长' });
+  const holder = claimControl(u, id);
+  if (holder) return reply.code(409).send(controlBusy(holder));
   try {
     await pasteTextInInstance(findInstance(id)!, text);
     return { ok: true };
@@ -1075,6 +1094,8 @@ app.post('/api/instances/:id/key', async (req, reply) => {
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
   const { key } = (req.body as any) ?? {};
   if (!key || typeof key !== 'string') return reply.code(400).send({ error: '按键名为空' });
+  const holder = claimControl(u, id);
+  if (holder) return reply.code(409).send(controlBusy(holder));
   try {
     await keyInInstance(findInstance(id)!, key);
     return { ok: true };
