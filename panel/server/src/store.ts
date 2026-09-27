@@ -31,7 +31,7 @@ export const APP_TYPES: AppType[] = ['wechat', 'telegram', 'chromium', 'custom']
 export const APP_LABELS: Record<AppType, string> = {
   wechat: '微信',
   telegram: 'Telegram',
-  chromium: '浏览器',
+  chromium: 'Chromium', // 与前端新建实例时的选项名一致（自动命名用）
   custom: '自定义应用',
 };
 // 向后兼容：v1.2.0 之前创建的实例没有 appType 字段，一律视为微信。
@@ -313,6 +313,15 @@ function parseIdFromVolume(volumeName: string): string | null {
   return m ? m[1] : null;
 }
 
+// 名称留空时自动命名：「微信 1」「微信 2」……取第一个没被占用的编号
+function autoInstanceName(type: AppType): string {
+  const used = new Set(data.instances.map((i) => i.name));
+  for (let n = 1; ; n++) {
+    const name = `${APP_LABELS[type]} ${n}`;
+    if (!used.has(name)) return name;
+  }
+}
+
 export function createInstance(
   name: string,
   createdBy: string,
@@ -332,7 +341,7 @@ export function createInstance(
   }
   const inst: Instance = {
     id,
-    name: name.trim() || `${APP_LABELS[type]}-${id.slice(0, 4)}`,
+    name: name.trim() || autoInstanceName(type),
     appType: type,
     containerName: `woc-wx-${id}`,
     volumeName,

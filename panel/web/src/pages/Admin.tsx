@@ -2011,7 +2011,7 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
             </button>
           ))}
         </div>
-        <input className="input" placeholder="实例名称（留空自动命名）" value={name} onChange={(e) => setName(e.target.value)} />
+        <input className="input" placeholder="实例名称（留空自动命名）" maxLength={30} value={name} onChange={(e) => setName(e.target.value)} />
         {appType === 'chromium' && (
           <div className="muted small">Chromium 浏览器随镜像就绪，创建后直接「进入实例」即可（无需下载安装）。</div>
         )}
@@ -2047,7 +2047,7 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
           <button type="button" className="btn" onClick={onClose}>
             取消
           </button>
-          <button className="btn btn-primary" disabled={busy || !name.trim()}>
+          <button className="btn btn-primary" disabled={busy}>
             创建
           </button>
         </div>
