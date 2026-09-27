@@ -15,7 +15,7 @@ import type { FastifyRequest } from 'fastify';
 export const MiB = 1024 * 1024;
 export const GiB = 1024 * MiB;
 
-// 带 HTTP 状态码的上传错误（413 太大 / 411 缺长度 / 507 空间不足 ……）
+// 带 HTTP 状态码的上传错误（413 太大 / 507 空间不足 / 400 中断或格式不对 ……）
 export class UploadError extends Error {
   constructor(
     public statusCode: number,
