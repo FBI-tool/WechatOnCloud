@@ -871,7 +871,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!showVnc || !id || !soundOn) return; // 声音默认关：未开则完全不连音频桥（回到 1.1.7 无音频的连接行为）
     const audio = new VncAudio(id, micOn);
     audioRef.current = audio;
-    audio.connect();
+    audio.connect().catch(() => {}); // 加载 socket.io 失败：本次无声，再开一次「声音」会重新加载
     const isFocused = () => !document.hidden && document.hasFocus();
     const sync = () => audio.setActive(isFocused());
     sync(); // 初始：若当前已聚焦则立即开声
