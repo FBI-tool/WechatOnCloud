@@ -76,10 +76,27 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
     // 其它非可见键（方向键/功能键等）放行
   };
 
+  // 焦点守卫：本机输入法只在焦点落在可编辑元素上时才启用，无感模式靠的是 KasmVNC 的隐藏输入框 noVNC_keyboardinput。
+  // KasmVNC 在 iframe 里不拦 canvas 上 mousedown 的默认聚焦（它只在顶层页面才 preventDefault），平时靠「输入框正有焦点时
+  // 拦下 mousedown」保住焦点；可输入框一旦因任何原因失焦，下一次点画面焦点就会落到 canvas 上——canvas 不可编辑，
+  // 浏览器随即停用输入法（候选框消失、只能打英文），而且之后每次点击都会重演、再也回不到输入框，只能刷新页面。
+  // 故焦点一落到 canvas 就交还给输入框（IME 模式下 noVNC 自己聚焦的也正是它，键盘监听两处都挂着，不影响按键）。
+  // 只在 KasmVNC 的 IME 模式确实开着时这么做：万一它没开（enable_ime 与本页模式不一致），输入框上的中文会被
+  // noVNC 按 keysym 再发一遍，与这里的转发重复。
+  const onFocusIn = (ev: Event) => {
+    if ((ev.target as Element | null)?.tagName !== 'CANVAS') return;
+    const imeSetting = doc.getElementById('noVNC_setting_enable_ime') as HTMLInputElement | null;
+    if (imeSetting && !imeSetting.checked) return;
+    const ki = doc.getElementById('noVNC_keyboardinput') as HTMLTextAreaElement | null;
+    if (ki && doc.activeElement !== ki) ki.focus({ preventScroll: true });
+  };
+
   doc.addEventListener('compositionend', onCompositionEnd, true);
+  doc.addEventListener('focusin', onFocusIn, true);
   win.addEventListener('keydown', onKeyDownCapture, true);
   return () => {
     doc.removeEventListener('compositionend', onCompositionEnd, true);
+    doc.removeEventListener('focusin', onFocusIn, true);
     win.removeEventListener('keydown', onKeyDownCapture, true);
   };
 }
@@ -187,14 +204,24 @@ function humanSize(n: number) {
 // 连不上时抛 "Failed to connect to MetaMask"）。这类错误与远程桌面无关（此时 VNC 仍是 connected），若据此重载，
 // 装了这类扩展的用户桌面会每十几秒被我们自己的自愈逻辑重载一次（实测 MetaMask：约 13s 一次，#122 同型）。
 // 浮层里带完整堆栈，据扩展协议地址即可区分：扩展错误只关掉浮层、不重载；KasmVNC 自身的崩溃照旧自愈。
+//
+// 两个细节：
+//   - 浮层内容是「消息 / 出错位置 / 堆栈」几个相邻 div，直接取 textContent 会粘成 "…MetaMaskchrome-extension://…"，
+//     \b 在两个字母之间不成立 → 没带堆栈的扩展报错被当成致命错误、整页重载。故逐段取文字再用空格拼。
+//   - KasmVNC 的错误处理器只展示第一条错误：浮层内容非空就直接 return、不再打开浮层。关掉扩展误报时若不清空内容，
+//     之后 KasmVNC 自己真的崩了（如断线重连时的 lastActiveAt）浮层也不会再弹，这里就再也检测不到，自愈整页失效，
+//     桌面停在断开状态，只能手动刷新 / 重启实例。
 const EXTENSION_SRC = /\b(?:chrome|moz|safari(?:-web)?|ms-browser)-extension:\/\//i;
 function fatalErrorMsg(doc: Document | null | undefined, onExtensionError?: (msg: string) => void): string | null {
   try {
     const el = doc?.getElementById('noVNC_fallback_error');
     if (el && el.classList.contains('noVNC_open')) {
-      const msg = doc?.getElementById('noVNC_fallback_errormsg')?.textContent?.trim() || 'KasmVNC 致命错误';
+      const box = doc?.getElementById('noVNC_fallback_errormsg');
+      const parts = Array.from(box?.children || []).map((c) => c.textContent?.trim()).filter(Boolean);
+      const msg = parts.join(' ') || box?.textContent?.trim() || 'KasmVNC 致命错误';
       if (EXTENSION_SRC.test(msg)) {
         el.classList.remove('noVNC_open'); // 关掉误报浮层，桌面照常用
+        box?.replaceChildren(); // 清空，让 KasmVNC 之后的真错误还能弹出浮层（见上）
         onExtensionError?.(msg);
         return null;
       }
@@ -204,6 +231,14 @@ function fatalErrorMsg(doc: Document | null | undefined, onExtensionError?: (msg
     /* 同源正常不会到这 */
   }
   return null;
+}
+
+// 错误事件是否来自浏览器扩展注入的脚本（出错文件 / 堆栈里带扩展协议地址）。
+// 用于在 KasmVNC 的全局错误处理器之前截下它，连浮层都不让弹（否则 MetaMask 这类每十几秒报一次的扩展会让浮层反复闪）。
+function isExtensionError(ev: Event): boolean {
+  const e = ev as Partial<ErrorEvent> & Partial<PromiseRejectionEvent>;
+  const src = [e.filename, e.error?.stack, e.reason?.stack].filter(Boolean).join(' ');
+  return EXTENSION_SRC.test(src);
 }
 
 // 致命崩溃自愈限频：同一实例 5 分钟内最多自动重连 4 次，超限改走手动恢复，杜绝"崩溃→重载→又崩"的死循环。
@@ -270,6 +305,11 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const isAdmin = user?.role === 'admin';
 
   const [frameLoaded, setFrameLoaded] = useState(false);
+  // iframe 每载入一个新文档就 +1。iframe 会在页内自行换文档：实例短暂不可用时反代先回「自动重连」页，它 3s 后
+  // location.reload() 进 noVNC（重启 / 升级 / 自愈 / 断线后的整页重连都可能碰上）。这时 frameLoaded 早已是 true，
+  // setFrameLoaded(true) 不触发重渲染——所以凡是往 iframe 的 window / document 挂监听的 effect 都必须依赖 frameGen，
+  // 否则监听还挂在已销毁的旧文档上：无感输入的中文转发（打的中文被吞、只剩英文）、粘贴桥、控制权心跳全部静默失效。
+  const [frameGen, setFrameGen] = useState(0);
   const [loadStuck, setLoadStuck] = useState(false); // iframe 久未加载出来（疑似实例无响应）
   const [dragging, setDragging] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
@@ -551,7 +591,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         /* ignore */
       }
     };
-  }, [showVnc, id, frameLoaded]);
+  }, [showVnc, id, frameLoaded, frameGen]);
 
   // 进入/重连桌面前，按输入模式设 KasmVNC 的 enable_ime（iframe 同源共享 localStorage，加载前设好即生效）。
   //   无感（seamless）：enable_ime=true，启用 noVNC 合成 textarea；中文 keysym 已被容器补丁抑制，
@@ -589,7 +629,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       onPlainPaste: () => void api.keyInInstance(id, 'ctrl+v').catch(() => {}),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showVnc, frameLoaded, id]);
+  }, [showVnc, frameLoaded, frameGen, id]);
 
   // 无感模式：往同源 iframe 装「中文转发 + 有序队列」钩子；切回转发/重连/卸载时自动移除。
   useEffect(() => {
@@ -599,7 +639,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!win || !doc) return;
     const cleanup = installSeamlessIme(win, doc, id);
     return cleanup;
-  }, [inputMode, showVnc, frameLoaded, id]);
+  }, [inputMode, showVnc, frameLoaded, frameGen, id]);
 
   // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流（扬声器恒开，无需手动找工具条）；
   // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
@@ -654,7 +694,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         /* ignore */
       }
     };
-  }, [showVnc, id, soundOn, frameLoaded]);
+  }, [showVnc, id, soundOn, frameLoaded, frameGen]);
 
   // 致命崩溃自愈：仅在 KasmVNC 真的弹出致命错误浮层时触发——整页重载是干净重连的唯一可靠路径
   // （旧 ws 已死，重载后干净重连；与 setMode/restartInstance 同理，不会引发新旧 ws 并存卡死 Xvnc）。
@@ -715,33 +755,41 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
 
   // 更快的致命崩溃捕获：直接监听同源 iframe window 的 'error'（KasmVNC 报 Uncaught 时同步触发，比 3s 轮询快），
   // 但仅在延迟复核确认致命错误浮层真的弹出后才重连——排除良性报错，杜绝误重载。
+  // 用捕获阶段注册：事件的目标就是 window，捕获监听先于 KasmVNC 的错误处理器执行，扩展报错在这里就截下，不弹浮层。
   useEffect(() => {
     if (!showVnc || !frameLoaded || !id) return;
     const win = frameRef.current?.contentWindow;
     if (!win) return;
-    const onErr = () => {
+    const onErr = (ev: Event) => {
+      if (ev.type === 'error' && ev.target !== win) return; // 捕获阶段也会收到 img 等资源加载失败，与崩溃无关
+      if (isExtensionError(ev)) {
+        ev.stopImmediatePropagation();
+        const e = ev as Partial<ErrorEvent> & Partial<PromiseRejectionEvent>;
+        onExtensionError(String(e.message || e.reason?.message || e.reason || ''));
+        return;
+      }
       window.setTimeout(() => {
         const msg = fatalErrorMsg(frameRef.current?.contentDocument, onExtensionError);
         if (msg) recoverFromFatal(msg);
       }, 400);
     };
     try {
-      win.addEventListener('error', onErr);
+      win.addEventListener('error', onErr, true);
       // KasmVNC 对 Promise 未处理拒绝也会弹同一个浮层（扩展报错多走这条），一并快速处理，免得浮层挂满 3s 轮询间隔
-      win.addEventListener('unhandledrejection', onErr);
+      win.addEventListener('unhandledrejection', onErr, true);
     } catch {
       return;
     }
     return () => {
       try {
-        win.removeEventListener('error', onErr);
-        win.removeEventListener('unhandledrejection', onErr);
+        win.removeEventListener('error', onErr, true);
+        win.removeEventListener('unhandledrejection', onErr, true);
       } catch {
         /* ignore */
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showVnc, frameLoaded, id]);
+  }, [showVnc, frameLoaded, frameGen, id]);
 
   if (!id) {
     nav('/', { replace: true });
@@ -1196,6 +1244,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             allow="clipboard-read; clipboard-write; microphone; camera; autoplay"
             onLoad={() => {
               setFrameLoaded(true);
+              setFrameGen((g) => g + 1); // iframe 页内换文档时也要重挂监听（见 frameGen 定义处）
               if (id) api.clientLog(id, 'iframe 已加载（noVNC 页面就绪，开始连 VNC）');
               setTimeout(() => {
                 focusFrame(); // 加载完把键盘焦点交给 VNC
