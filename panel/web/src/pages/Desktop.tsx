@@ -91,12 +91,28 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
     if (ki && doc.activeElement !== ki) ki.focus({ preventScroll: true });
   };
 
+  // 候选框跟着点击位置走（issue #131「中文输入法显示框在对话中间」）：本机输入法的候选框贴着隐藏输入框的光标弹出，
+  // 而 KasmVNC 把它固定在画面 35%/40% 处，无论点的是哪儿，候选框都飘在对话中间。点画面时把它挪到点击处——
+  // 用户点的通常就是应用的输入框，候选框随之出现在输入框旁边。1×1 透明、在画面下层，挪动不影响显示与点击。
+  const onMouseDown = (ev: MouseEvent) => {
+    if ((ev.target as Element | null)?.tagName !== 'CANVAS') return;
+    const ki = doc.getElementById('noVNC_keyboardinput') as HTMLTextAreaElement | null;
+    const box = ki?.offsetParent?.getBoundingClientRect();
+    if (!ki || !box || !box.width || !box.height) return;
+    const x = Math.min(Math.max(ev.clientX - box.left, 0), box.width - 2);
+    const y = Math.min(Math.max(ev.clientY - box.top, 0), box.height - 2);
+    ki.style.left = `${Math.round(x)}px`;
+    ki.style.top = `${Math.round(y)}px`;
+  };
+
   doc.addEventListener('compositionend', onCompositionEnd, true);
   doc.addEventListener('focusin', onFocusIn, true);
+  doc.addEventListener('mousedown', onMouseDown, true);
   win.addEventListener('keydown', onKeyDownCapture, true);
   return () => {
     doc.removeEventListener('compositionend', onCompositionEnd, true);
     doc.removeEventListener('focusin', onFocusIn, true);
+    doc.removeEventListener('mousedown', onMouseDown, true);
     win.removeEventListener('keydown', onKeyDownCapture, true);
   };
 }
