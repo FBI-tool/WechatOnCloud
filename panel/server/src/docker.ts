@@ -122,9 +122,10 @@ function realisticMac(id: string): string {
 
 const docker = new Docker(); // 默认连 /var/run/docker.sock
 
-// 面板自身所在的 docker 网络名；新实例都 attach 到它，便于按容器名互访。
+// 实例接入的 docker 网络名。默认是实例专用网络（见 ensureNetwork）；WOC_DOCKER_NETWORK 显式指定时用指定的。
 const EXPLICIT_NETWORK = (process.env.WOC_DOCKER_NETWORK || '').trim() || null;
-let networkName: string | null = EXPLICIT_NETWORK;
+const INSTANCE_NETWORK = (process.env.WOC_INSTANCE_NETWORK || '').trim() || 'woc-instances';
+let networkName: string | null = null;
 
 export type RuntimeState = 'running' | 'stopped' | 'missing';
 
@@ -161,12 +162,13 @@ export async function inspectSelf(): Promise<any | null> {
 }
 
 // 面板所在的网络（去掉 none/host），按名字排序。
-async function selfNetworks(): Promise<string[] | null> {
-  const self = await inspectSelf();
-  if (!self) return null;
-  return Object.keys(self.NetworkSettings?.Networks || {})
+const netsOf = (self: any): string[] =>
+  Object.keys(self?.NetworkSettings?.Networks || {})
     .filter((n) => n !== 'none' && n !== 'host')
     .sort();
+async function selfNetworks(): Promise<string[] | null> {
+  const self = await inspectSelf();
+  return self ? netsOf(self) : null;
 }
 
 // 探测结果只在面板日志里提示一次（ensureNetwork 探测失败时每次建实例都会重试）。
@@ -177,11 +179,107 @@ function warnNetworkOnce(key: string, msg: string): void {
   appendPanelLog('WARN', msg);
 }
 
-// 探测面板自身网络，新建/重建的实例都接到这里。失败不致命：返回 null（实例落到 docker 默认 bridge，
-// 反代按名访问不到，故尽量探测成功；探测不到时可用 WOC_DOCKER_NETWORK 显式指定）。
-export async function ensureNetwork(): Promise<string | null> {
-  if (networkName) return networkName;
-  const nets = await selfNetworks();
+// ---------- 实例专用网络 ----------
+// 实例只接入一个专用网络（默认 woc-instances），面板自己也接上它，按容器名访问实例。此前实例直接接到面板所在的
+// 网络：面板部署在 1Panel 的 1panel-network、反代所在网络这类共享网络上时，跑着微信 / 浏览器等不可信内容的实例
+// 能直接访问同网络里的数据库、其它服务。专用网络建不起来（socket-proxy 加固部署没开放网络接口、地址池耗尽等）时
+// 退回旧做法并在面板日志提示。已有实例在下次重启 / 升级 / 自愈重建时迁过来（重建沿用同一个伪装 MAC），不主动重启。
+let isolatedNet: { subnet: string; gateway: string } | null = null; // 专用网络生效时的网段（拦截来自实例的请求用）
+
+async function attachSelfToInstanceNetwork(self: any): Promise<void> {
+  const net = docker.getNetwork(INSTANCE_NETWORK);
+  let info: any = await net.inspect().catch((e: any) => {
+    if (e?.statusCode === 404) return null;
+    throw e;
+  });
+  if (!info) {
+    await docker
+      .createNetwork({ Name: INSTANCE_NETWORK, Driver: 'bridge', CheckDuplicate: true, Labels: { 'com.wechatoncloud.role': 'instances' } } as any)
+      .catch((e: any) => {
+        if (e?.statusCode !== 409) throw e; // 409 = 同时被别处建好了
+      });
+    info = await net.inspect();
+    appendPanelLog('INFO', `已创建实例专用网络 ${INSTANCE_NETWORK}，之后新建 / 重启的实例都接到这里，与面板所在的其它网络隔离`);
+  }
+  if (!netsOf(self).includes(INSTANCE_NETWORK)) {
+    // GwPriority < 0：面板的默认网关（出网、端口映射）仍走原来的网络；不设的话网络名排序靠前时默认网关会换到这边
+    try {
+      await net.connect({ Container: self.Id, EndpointConfig: { GwPriority: -1 } } as any);
+    } catch (e: any) {
+      if (!/already exists|already attached/i.test(String(e?.message))) throw e;
+    }
+  }
+  const cfg = (info?.IPAM?.Config || []).find((c: any) => c?.Subnet && !String(c.Subnet).includes(':'));
+  isolatedNet = cfg ? { subnet: String(cfg.Subnet), gateway: String(cfg.Gateway || '') } : null;
+}
+
+// 请求是否来自实例（专用网络网段内、且不是网关——经宿主转发进来的请求源地址是网关）。实例从不需要访问面板，
+// 拦掉可以让被攻破的实例碰不到面板的登录与接口。
+export function isFromInstanceNetwork(addr: string | undefined): boolean {
+  if (!isolatedNet || !addr) return false;
+  const ip = addr.replace(/^::ffff:/, '');
+  if (!ip || ip === isolatedNet.gateway || ip.includes(':')) return false;
+  const [base, bits] = isolatedNet.subnet.split('/');
+  const toInt = (x: string) => x.split('.').reduce((a, o) => (a << 8) + (Number(o) & 255), 0) >>> 0;
+  const n = Number(bits);
+  if (!(n >= 0 && n <= 32)) return false;
+  const mask = n === 0 ? 0 : (~0 << (32 - n)) >>> 0;
+  return ((toInt(ip) & mask) >>> 0) === ((toInt(base) & mask) >>> 0);
+}
+
+export function instanceNetworkName(): string | null {
+  return isolatedNet ? INSTANCE_NETWORK : null;
+}
+
+// 面板容器被外部工具重建（compose up、1Panel / Portainer 的「重建」、飞牛应用更新）后，运行时接上的网络会丢失，
+// 已迁到专用网络的实例就连不上了（502）。启动时 ensureNetwork 会接回去；这里定期复查兜底，
+// 启动时没接上（docker 一时没响应等）的也在这里补接。
+export function watchInstanceNetwork(): void {
+  if (EXPLICIT_NETWORK) return;
+  setInterval(async () => {
+    const self = await inspectSelf().catch(() => null);
+    if (!self || netsOf(self).includes(INSTANCE_NETWORK)) return;
+    const was = networkName === INSTANCE_NETWORK;
+    try {
+      await attachSelfToInstanceNetwork(self);
+      networkName = INSTANCE_NETWORK;
+      appendPanelLog(
+        was ? 'WARN' : 'INFO',
+        was
+          ? `面板不在实例专用网络 ${INSTANCE_NETWORK} 上了（容器被重建过？），已重新接上`
+          : `已接入实例专用网络 ${INSTANCE_NETWORK}，之后新建 / 重启的实例都接到这里`,
+      );
+    } catch (e: any) {
+      if (was) appendPanelLog('ERROR', `面板重新接入实例专用网络 ${INSTANCE_NETWORK} 失败：${e?.message || e}`);
+    }
+  }, 2 * 60 * 1000).unref();
+}
+
+// 新建/重建的实例接到哪个网络。优先实例专用网络；WOC_DOCKER_NETWORK 显式指定时用指定的；
+// 都不行时退回面板自身所在的网络。失败不致命：返回 null（实例落到 docker 默认 bridge，反代按名访问不到）。
+let ensuring: Promise<string | null> | null = null;
+export function ensureNetwork(): Promise<string | null> {
+  if (networkName) return Promise.resolve(networkName);
+  if (!ensuring) ensuring = resolveNetwork().finally(() => (ensuring = null));
+  return ensuring;
+}
+async function resolveNetwork(): Promise<string | null> {
+  if (EXPLICIT_NETWORK) return (networkName = EXPLICIT_NETWORK);
+  const self = await inspectSelf();
+  if (self) {
+    try {
+      await attachSelfToInstanceNetwork(self);
+      return (networkName = INSTANCE_NETWORK);
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      warnNetworkOnce(
+        'isolation',
+        `没能建立实例专用网络 ${INSTANCE_NETWORK}（${msg}），实例暂时仍接到面板所在的网络、与同网络的其它容器互通。` +
+          (/403|forbidden|denied/i.test(msg) ? '多见于 socket-proxy 加固部署没开放 NETWORKS 权限，见 doc/安全加固.md' : ''),
+      );
+    }
+  }
+  const nets = self ? netsOf(self) : null;
   // 默认 bridge 不支持按容器名解析。面板同时在 bridge 和自定义网络上时必须选自定义网络——旧逻辑取排序后
   // 第一个，网络名排在 "bridge" 之后（如 proxy、traefik）就会选中 bridge，实例全部 502。
   const pick = nets?.find((n) => n !== 'bridge') || nets?.[0] || null;
@@ -208,8 +306,9 @@ export async function ensureNetwork(): Promise<string | null> {
 }
 
 // 启动时体检一次（只记日志、不动实例）：① 显式指定的 WOC_DOCKER_NETWORK 面板自己不在上面；
-// ② 运行中的实例和面板不在任何一个共同的自定义网络上（旧版探测失败时建到了 bridge 的实例，#103）。
-// 两者都表现为桌面 502 / 一直重连；② 点「重启」即会把实例重建到面板网络（数据保留）。
+// ② 运行中的实例和面板不在任何一个共同的自定义网络上（旧版探测失败时建到了 bridge 的实例，#103）；
+// ③ 专用网络生效后，还留在共享网络上的老实例（下次重建时自动迁移）。
+// ① ② 表现为桌面 502 / 一直重连；② 点「重启」即会把实例重建到面板网络（数据保留）。
 export async function checkInstanceNetworks(instances: Instance[]): Promise<void> {
   const nets = await selfNetworks();
   if (!nets) return;
@@ -223,15 +322,23 @@ export async function checkInstanceNetworks(instances: Instance[]): Promise<void
   const shared = new Set(nets.filter((n) => n !== 'bridge'));
   if (!shared.size) return; // 面板自己就不在自定义网络上：ensureNetwork 已提示
   const stray: string[] = [];
+  const pending: string[] = [];
   for (const inst of instances) {
     try {
       const info: any = await docker.getContainer(inst.containerName).inspect();
-      if (!info.State?.Running) continue;
       const own = Object.keys(info.NetworkSettings?.Networks || {});
+      if (isolatedNet && !own.includes(INSTANCE_NETWORK)) pending.push(`「${inst.name}」`);
+      if (!info.State?.Running) continue;
       if (!own.some((n) => shared.has(n))) stray.push(`「${inst.name}」(${own.join('/') || '无网络'})`);
     } catch {
       /* 容器不存在：启动流程会按当前配置新建 */
     }
+  }
+  if (pending.length) {
+    appendPanelLog(
+      'INFO',
+      `实例${pending.join('、')} 还在面板所在的共享网络上，下次重启 / 升级时会自动迁到专用网络 ${INSTANCE_NETWORK}（数据与设备标识不变）；想立即隔离可在管理页点「重启」`,
+    );
   }
   if (stray.length) {
     appendPanelLog(

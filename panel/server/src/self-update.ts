@@ -73,6 +73,17 @@ function envToMap(env?: string[] | null): Map<string, string> {
   return m;
 }
 
+// 重建时 create 用的主网络：旧容器创建时的网络（compose 的项目网络等，HostConfig.NetworkMode）；
+// 其余网络 create 之后再 connect。不能按名字排序取第一个：面板现在还接着实例专用网络 woc-instances，
+// 名字排在前面时主网络会变成它，面板丢掉原来的网络（与之同网的反代按名访问不到面板）。
+const INSTANCE_NETWORK = (process.env.WOC_INSTANCE_NETWORK || '').trim() || 'woc-instances';
+function primaryNetwork(self: any): string | null {
+  const names = Object.keys(self.NetworkSettings?.Networks || {});
+  const mode = String(self.HostConfig?.NetworkMode || '');
+  if (names.includes(mode)) return mode;
+  return names.find((n) => n !== INSTANCE_NETWORK) || names[0] || null;
+}
+
 // 由旧容器 inspect + 目标镜像，构造重建用的 create 选项（含 env-diff 与网络）。
 async function buildCreateOpts(self: any, imageRef: string): Promise<Docker.ContainerCreateOptions> {
   const newImg: any = await docker.getImage(imageRef).inspect();
@@ -94,7 +105,6 @@ async function buildCreateOpts(self: any, imageRef: string): Promise<Docker.Cont
   }
   const cfg = self.Config || {};
   const nets: Record<string, any> = self.NetworkSettings?.Networks || {};
-  const netNames = Object.keys(nets);
   const opts: Docker.ContainerCreateOptions = {
     name: String(self.Name || '').replace(/^\//, '') || PANEL_NAME, // 用目标容器自身名字，而非硬编码常量
     Image: imageRef,
@@ -110,8 +120,8 @@ async function buildCreateOpts(self: any, imageRef: string): Promise<Docker.Cont
     ExposedPorts: cfg.ExposedPorts || undefined,
     HostConfig: self.HostConfig,
   };
-  if (netNames.length) {
-    const primary = netNames[0];
+  const primary = primaryNetwork(self);
+  if (primary) {
     const aliases = (nets[primary].Aliases || []).filter((a: string) => !String(self.Id).startsWith(a));
     opts.NetworkingConfig = { EndpointsConfig: { [primary]: { Aliases: aliases } } };
   }
@@ -223,7 +233,8 @@ export async function runUpdaterRecreate(): Promise<void> {
   console.log(`[updater] 重建面板 ${panelName} → ${newImage}`);
   await new Promise((r) => setTimeout(r, 2500)); // 稍等：让面板把 HTTP 响应回给前端后再停它，避免前端误报"更新失败"
   const self: any = await docker.getContainer(panelName).inspect(); // 先抓旧配置（停之前）
-  const otherNets = Object.keys(self.NetworkSettings?.Networks || {}).slice(1);
+  const primary = primaryNetwork(self);
+  const otherNets = Object.keys(self.NetworkSettings?.Networks || {}).filter((n) => n !== primary);
 
   const recreate = async (imageRef: string) => {
     const opts = await buildCreateOpts(self, imageRef);
@@ -235,9 +246,10 @@ export async function runUpdaterRecreate(): Promise<void> {
     const c = await docker.createContainer(opts);
     for (const net of otherNets) {
       try {
-        await docker.getNetwork(net).connect({ Container: c.id });
+        // 实例专用网络不当默认网关（同 docker.ts attachSelfToInstanceNetwork）
+        await docker.getNetwork(net).connect({ Container: c.id, ...(net === INSTANCE_NETWORK ? { EndpointConfig: { GwPriority: -1 } } : {}) } as any);
       } catch {
-        /* 次要网络连接失败不致命 */
+        /* 次要网络连接失败不致命（实例专用网络面板启动时会自己接上） */
       }
     }
     await c.start();

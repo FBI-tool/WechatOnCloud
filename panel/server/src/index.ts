@@ -41,6 +41,8 @@ import {
 import {
   ensureNetwork,
   checkInstanceNetworks,
+  watchInstanceNetwork,
+  isFromInstanceNetwork,
   inspectSelf,
   ensureRunning,
   runInstance,
@@ -136,6 +138,14 @@ initStore();
 cleanSpoolDir(); // 上次异常退出时没收完 / 没处理完的上传暂存
 
 const app = Fastify({ logger: true, trustProxy: true });
+
+// 实例从不需要访问面板：来自实例专用网络的请求一律拒绝，被攻破的实例碰不到面板的登录与接口（见 docker.ts ensureNetwork）
+app.addHook('onRequest', async (req, reply) => {
+  if (isFromInstanceNetwork(req.socket.remoteAddress)) {
+    reply.header('connection', 'close').code(403).send({ error: 'forbidden' });
+    return reply;
+  }
+});
 
 // DNS-rebinding gate: reject requests whose Host header is neither a loopback /
 // RFC1918 LAN address nor in PANEL_ALLOWED_HOSTS. Runs before every route so
@@ -1756,6 +1766,10 @@ app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) =>
     }
     socket.destroy();
   };
+  if (isFromInstanceNetwork(req.socket.remoteAddress)) {
+    reject(`来自实例专用网络的连接（${req.socket.remoteAddress}），实例不允许访问面板`);
+    return;
+  }
   // DNS-rebinding gate for WebSocket upgrades (Fastify's onRequest hook does
   // not run on raw upgrades). KasmVNC proxying goes through this path.
   if (!isRequestHostAllowed(req.headers.host, req.headers['x-forwarded-host'], ALLOWED_HOSTS)) {
@@ -1824,6 +1838,7 @@ for (const pub of listInstances()) {
 }
 // 体检：和面板不在同一网络的实例（旧版探测失败时建到 bridge 的，#103）在面板日志里点名，只提示不动实例
 void checkInstanceNetworks(listInstances()).catch(() => {});
+watchInstanceNetwork();
 
 // 启动时清一次旧版本 woc 镜像：面板自更新会留下旧的 woc-panel 镜像（helper 用新镜像重建面板后，
 // 旧镜像不再被任何容器引用，但带 tag 不是 dangling，清不掉）——在这里回收，也作为周期性兜底。

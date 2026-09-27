@@ -22,6 +22,7 @@ services:
       VOLUMES: 1      # 孤儿卷列举与清理
       POST: 1         # 允许 POST 方法（create/start/exec-start/pull 等写操作均依赖此项）
       INFO: 1         # /info 端点（诊断包中展示 Docker 版本与资源概况）
+      NETWORKS: 1     # 建实例专用网络 woc-instances 并把面板接上（实例与面板所在的其它网络隔离）
       # ── 显式拒绝项 ───────────────────────────────────────────────────
       BUILD: 0        # 禁止镜像构建
       COMMIT: 0       # 禁止容器提交为镜像
@@ -30,7 +31,6 @@ services:
       SECRETS: 0      # 禁止 Swarm 密钥操作
       PLUGINS: 0      # 禁止插件管理
       NODES: 0        # 禁止节点管理
-      NETWORKS: 0     # 禁止网络 CRUD（面板仅在创建容器时引用网络名，不调用网络 API）
       AUTH: 0
       CONFIGS: 0
       DISTRIBUTION: 0
