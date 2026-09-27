@@ -20,11 +20,21 @@ function desktopUrl(id: string) {
 //   彻底消除"中文走异步、数字走 keysym 抢跑"导致的"你好123→23"丢字。
 // - 队列空闲时不干预：英文/数字仍走原生 keysym，零延迟。
 // 返回清理函数（切回转发模式 / 重连 / 卸载时移除监听）。
-function installSeamlessIme(win: Window, doc: Document, instId: string): () => void {
+function installSeamlessIme(
+  win: Window,
+  doc: Document,
+  instId: string,
+  onTyped: (text: string) => void,
+  onFail: (err: any) => void,
+): () => void {
   type Job = { kind: 'text'; data: string } | { kind: 'key'; data: string };
   const queue: Job[] = [];
   let draining = false;
   const active = () => draining || queue.length > 0;
+  // /type 单次上限 500 字（语音输入、长句提交可能超过），按段入队，免得整段被拒后丢失
+  const pushText = (data: string) => {
+    for (let i = 0; i < data.length; i += 500) queue.push({ kind: 'text', data: data.slice(i, i + 500) });
+  };
 
   const drain = async () => {
     if (draining) return;
@@ -32,10 +42,13 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
     while (queue.length) {
       const job = queue[0];
       try {
-        if (job.kind === 'text') await api.typeInInstance(instId, job.data);
+        if (job.kind === 'text') {
+          onTyped(job.data);
+          await api.typeInInstance(instId, job.data);
+        }
         else await api.keyInInstance(instId, job.data);
-      } catch {
-        /* 单条失败丢弃，继续后续，避免卡住队列 */
+      } catch (e) {
+        onFail(e); // 单条失败丢弃、继续后续，避免卡住队列；但要让用户知道刚打的字没发出去
       }
       queue.shift();
     }
@@ -61,7 +74,7 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
     win.setTimeout(trimKeyboardInput, 0); // 等 noVNC 同步完差分基准（它在目标阶段处理 compositionend）
     const txt = (e as CompositionEvent).data;
     if (!txt) return;
-    queue.push({ kind: 'text', data: txt });
+    pushText(txt);
     drain();
   };
 
@@ -90,6 +103,22 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
       drain();
     }
     // 其它非可见键（方向键/功能键等）放行
+  };
+
+  // 不经合成、直接插进输入框的文字：不少输入法的全角标点（，。？）、系统表情面板、语音输入都这样进来。
+  // noVNC 对它们走「输入框差分 → 逐字 keysym」：非 ASCII 字符要临时映射键码，实测会丢；keysym 又经 websocket 直达，
+  // 会抢在走 HTTP 转发的中文前面（实测依次输入「你好」「，」「世界」「。」，远端收到「。你好世界」）。
+  // 在插入前截下，与中文走同一个有序队列。ASCII 只在队列忙时接管（保证顺序），空闲时照旧走 keysym，零延迟。
+  const onBeforeInput = (ev: Event) => {
+    const e = ev as InputEvent;
+    if (e.isComposing || composing) return; // 合成中的文字在 compositionend 统一转发
+    if (e.inputType !== 'insertText' && e.inputType !== 'insertReplacementText') return;
+    if (e.target !== doc.getElementById('noVNC_keyboardinput')) return;
+    const data = e.data ?? e.dataTransfer?.getData('text/plain') ?? '';
+    if (!data || (/^[\x20-\x7e]*$/.test(data) && !active())) return;
+    e.preventDefault(); // 不插入输入框：noVNC 不会再按 keysym 发一遍，它的差分基准也保持一致
+    pushText(data);
+    drain();
   };
 
   // 焦点守卫：本机输入法只在焦点落在可编辑元素上时才启用，无感模式靠的是 KasmVNC 的隐藏输入框 noVNC_keyboardinput。
@@ -123,12 +152,14 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
 
   doc.addEventListener('compositionstart', onCompositionStart, true);
   doc.addEventListener('compositionend', onCompositionEnd, true);
+  doc.addEventListener('beforeinput', onBeforeInput, true);
   doc.addEventListener('focusin', onFocusIn, true);
   doc.addEventListener('mousedown', onMouseDown, true);
   win.addEventListener('keydown', onKeyDownCapture, true);
   return () => {
     doc.removeEventListener('compositionstart', onCompositionStart, true);
     doc.removeEventListener('compositionend', onCompositionEnd, true);
+    doc.removeEventListener('beforeinput', onBeforeInput, true);
     doc.removeEventListener('focusin', onFocusIn, true);
     doc.removeEventListener('mousedown', onMouseDown, true);
     win.removeEventListener('keydown', onKeyDownCapture, true);
@@ -150,13 +181,20 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
 // 回到页面（focus）视为可能刚在外面复制/截图 → 本机为新；在桌面里 Ctrl/Cmd+C、X 或右键（微信里复制）→ 容器为新。
 // 但有些截图方式不让浏览器失焦（如 macOS 自带截图），只靠 focus 会把新截图误判为旧的——所以再看图片本身：
 // 和上次见过的不是同一张（类型+字节数不同）就一定是本机新产生的，照粘本机；同一张且其后在应用里复制过，才改粘容器。
+//
+// 文字同理（onLocalText）：本机剪贴板的文字比容器的新（在别处复制后回来直接 Ctrl+V，或局域网 http 下浏览器
+// 根本不同步剪贴板），就把本机文字贴进去；否则按原样在容器里 Ctrl+V，应用内复制粘贴保留应用自己的格式。
 function installPasteBridge(
   win: Window,
   doc: Document,
   topWin: Window,
-  handlers: { onImage: (file: File) => void; onPlainPaste: () => void },
+  handlers: {
+    onImage: (file: File) => void;
+    onPlainPaste: () => void;
+    onLocalText: (text: string, localIsFresh: boolean) => boolean;
+  },
 ): () => void {
-  type Pending = { handled: boolean };
+  type Pending = { handled: boolean; text: string };
   let pending: Pending | null = null;
   let localIsFresh = true;
   let lastLocalImage = ''; // 上次在 paste 里见到的本机图片签名
@@ -171,11 +209,13 @@ function installPasteBridge(
     }
     if (e.repeat || !isKey(e, 'KeyV', 'v')) return;
     e.stopImmediatePropagation();
-    const p: Pending = { handled: false };
+    const p: Pending = { handled: false, text: '' };
     pending = p;
     win.setTimeout(() => {
       if (pending === p) pending = null;
-      if (!p.handled) handlers.onPlainPaste();
+      if (p.handled) return;
+      if (p.text && handlers.onLocalText(p.text, localIsFresh)) return;
+      handlers.onPlainPaste();
     }, 0);
   };
 
@@ -186,7 +226,10 @@ function installPasteBridge(
     if (pending) e.preventDefault();
     const item = Array.from(e.clipboardData?.items || []).find((i) => i.kind === 'file' && i.type.startsWith('image/'));
     const file = item?.getAsFile();
-    if (!file) return;
+    if (!file) {
+      if (pending) pending.text = e.clipboardData?.getData('text/plain') || ''; // 交给定时器判断本机 / 容器谁新
+      return;
+    }
     const sig = `${file.type}:${file.size}`;
     const isNewImage = sig !== lastLocalImage;
     lastLocalImage = sig;
@@ -216,6 +259,104 @@ function installPasteBridge(
     topWin.removeEventListener('focus', onFocus);
     win.removeEventListener('focus', onFocus);
   };
+}
+
+// ---------- 剪贴板协调 ----------
+// KasmVNC 的无缝剪贴板是双向的：容器剪贴板一变就写本机剪贴板；本机的内容在「窗口重新获得焦点后第一次点画面」时推上去。
+// 两处与之冲突：① 打字（/type）靠借用容器剪贴板把字贴进应用，借用期间的临时内容会被同步到本机，覆盖用户复制的东西
+// （服务端打完约 1 秒会归还，归还时的内容再同步一次，本机若已有更新的复制也会被盖掉）；② 切到别处复制后回来直接
+// Ctrl+V（没点画面），本机内容还没推上去，粘到的是容器里的旧内容。
+// 这里记下容器剪贴板里「用户自己的」内容：打字借用的临时内容与归还时的原内容不写本机剪贴板；Ctrl+V 时本机内容比它新
+// 就直接贴本机的。浏览器剪贴板 API 不可用（局域网 http）时 KasmVNC 本就不同步，改用它收到的容器剪贴板文本 + 本机
+// 是否有过新复制来判断。
+interface ClipState {
+  guarded: boolean; // 已接管 KasmVNC 对浏览器剪贴板的读写
+  remoteText: string | null; // 容器剪贴板里用户自己的内容（null = 未知 / 是图片）
+  remoteNewer: boolean; // 容器有更新的内容但没能写进本机（如当时页面没焦点）
+  typed: { text: string; at: number }[]; // 近几秒借用剪贴板打的字
+  lastLocal: string | null; // 上次粘贴时见到的本机剪贴板文字
+}
+const TYPED_WINDOW_MS = 5000;
+function noteTyped(st: ClipState, text: string) {
+  const now = Date.now();
+  st.typed = st.typed.filter((x) => now - x.at < TYPED_WINDOW_MS);
+  st.typed.push({ text, at: now });
+}
+// 打字借用剪贴板引起的容器 → 本机同步：临时内容本身，或打字后归还的原内容（= 已知的容器内容）
+function isTransientClip(st: ClipState, text: string): boolean {
+  const now = Date.now();
+  const recent = st.typed.filter((x) => now - x.at < TYPED_WINDOW_MS);
+  return recent.some((x) => x.text === text) || (recent.length > 0 && text === st.remoteText);
+}
+async function clipItemsText(items: ClipboardItems | ClipboardItem[] | undefined): Promise<string | null> {
+  try {
+    const it = items?.[0];
+    if (it && it.types.includes('text/plain')) return await (await it.getType('text/plain')).text();
+  } catch {
+    /* 读不到文字部分 */
+  }
+  return null;
+}
+function installClipboardGuard(win: Window, st: ClipState): () => void {
+  const clip = (win.navigator as any).clipboard as Clipboard | undefined;
+  if (!clip || typeof clip.write !== 'function') {
+    st.guarded = false;
+    return () => {};
+  }
+  const orig = { write: clip.write, writeText: clip.writeText, read: clip.read, readText: clip.readText };
+  // 容器 → 本机
+  const guardWrite = async (text: string | null, doWrite: () => Promise<void>) => {
+    if (text !== null && isTransientClip(st, text)) return;
+    st.remoteText = text;
+    try {
+      await doWrite();
+      st.remoteNewer = false;
+    } catch (e) {
+      st.remoteNewer = true;
+      throw e;
+    }
+  };
+  const c = clip as any;
+  c.write = (items: ClipboardItems) => clipItemsText(items).then((t) => guardWrite(t, () => orig.write.call(clip, items)));
+  c.writeText = (t: string) => guardWrite(t, () => orig.writeText.call(clip, t));
+  // 本机 → 容器：KasmVNC 读本机剪贴板就是要推上去
+  const noteLocal = (t: string | null) => {
+    if (t === null) return;
+    st.remoteText = t;
+    st.remoteNewer = false;
+  };
+  c.read = () =>
+    orig.read.call(clip).then(async (items: ClipboardItems) => {
+      noteLocal(await clipItemsText(items));
+      return items;
+    });
+  c.readText = () =>
+    orig.readText.call(clip).then((t: string) => {
+      noteLocal(t);
+      return t;
+    });
+  st.guarded = true;
+  return () => {
+    for (const k of ['write', 'writeText', 'read', 'readText']) delete c[k];
+  };
+}
+// Ctrl+V 时本机剪贴板里的文字是否比容器的新（是则贴本机的）
+function shouldPasteLocal(st: ClipState, text: string, localIsFresh: boolean, doc: Document | null | undefined): boolean {
+  let local: boolean;
+  if (st.guarded) {
+    local = !st.remoteNewer && text !== st.remoteText;
+  } else {
+    // 没有剪贴板 API：本机内容推不上去，容器内容也下不来。本机自回到页面后有过新复制（与上次粘贴时见到的不同）、
+    // 且与 KasmVNC 收到的容器剪贴板文字不同，才算本机新；在应用里复制过（Ctrl+C / 右键）则以容器为准。
+    const remote = (doc?.getElementById('noVNC_clipboard_text') as HTMLTextAreaElement | null)?.value ?? null;
+    local = localIsFresh && text !== st.lastLocal && text !== remote;
+  }
+  st.lastLocal = text;
+  if (local) {
+    st.remoteText = text;
+    st.remoteNewer = false;
+  }
+  return local;
 }
 
 interface TFile {
@@ -362,6 +503,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   // setFrameLoaded(true) 不触发重渲染——所以凡是往 iframe 的 window / document 挂监听的 effect 都必须依赖 frameGen，
   // 否则监听还挂在已销毁的旧文档上：无感输入的中文转发（打的中文被吞、只剩英文）、粘贴桥、控制权心跳全部静默失效。
   const [frameGen, setFrameGen] = useState(0);
+  const clip = useRef<ClipState>({ guarded: false, remoteText: null, remoteNewer: false, typed: [], lastLocal: null }); // 见 installClipboardGuard
   const [loadStuck, setLoadStuck] = useState(false); // iframe 久未加载出来（疑似实例无响应）
   const [dragging, setDragging] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
@@ -680,8 +822,26 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       },
       // 粘贴容器剪贴板：失败时静默（与以前按键直通 noVNC 一样，不额外打扰）
       onPlainPaste: () => void api.keyInInstance(id, 'ctrl+v').catch(() => {}),
+      // 本机剪贴板的文字比容器的新：直接贴本机的
+      onLocalText: (text, localIsFresh) => {
+        if (!shouldPasteLocal(clip.current, text, localIsFresh, frameRef.current?.contentDocument)) return false;
+        void api.pasteText(id, text).catch((e: any) => toast(e?.message || '粘贴失败', 'error'));
+        return true;
+      },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showVnc, frameLoaded, frameGen, id]);
+
+  // 剪贴板协调（见 installClipboardGuard）：两种输入模式都生效
+  useEffect(() => {
+    if (!showVnc || !frameLoaded || !id) return;
+    const win = frameRef.current?.contentWindow;
+    if (!win) return;
+    try {
+      return installClipboardGuard(win, clip.current);
+    } catch {
+      return;
+    }
   }, [showVnc, frameLoaded, frameGen, id]);
 
   // 无感模式：往同源 iframe 装「中文转发 + 有序队列」钩子；切回转发/重连/卸载时自动移除。
@@ -690,7 +850,18 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     const win = frameRef.current?.contentWindow;
     const doc = frameRef.current?.contentDocument;
     if (!win || !doc) return;
-    const cleanup = installSeamlessIme(win, doc, id);
+    let lastFailToast = 0;
+    const cleanup = installSeamlessIme(
+      win,
+      doc,
+      id,
+      (t) => noteTyped(clip.current, t),
+      (e) => {
+        if (Date.now() - lastFailToast < 5000) return;
+        lastFailToast = Date.now();
+        toast(`刚输入的文字没能发送到桌面：${e?.message || '网络或实例暂时不可用'}，请重试`, 'error');
+      },
+    );
     return cleanup;
   }, [inputMode, showVnc, frameLoaded, frameGen, id]);
 
@@ -1041,6 +1212,8 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       if (!doc || !ta) return false;
       ta.value = text;
       ta.dispatchEvent(new (frameRef.current!.contentWindow as any).Event('change', { bubbles: true }));
+      clip.current.remoteText = text;
+      clip.current.remoteNewer = false;
       return true;
     } catch {
       return false;
@@ -1076,6 +1249,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!t.trim() || !id) return;
     setImeSending(true);
     try {
+      noteTyped(clip.current, t);
       await api.typeInInstance(id, t);
       // 打完补一个回车把消息发出去（issue #81）；可由「自动回车」开关关掉（issue #125），
       // 关掉时只把文字填进应用输入框，发不发由用户自己按。焦点【始终留在本输入条】。

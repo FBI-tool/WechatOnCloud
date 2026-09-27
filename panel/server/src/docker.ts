@@ -1473,23 +1473,115 @@ export async function snapshotContainerLog(inst: Instance, reason: string): Prom
   }
 }
 
+// 在实例 X 桌面里跑命令的公共开头：定位 DISPLAY，确认镜像里有 xclip / xdotool。
+const X_PRELUDE = [
+  'set -e',
+  'display="${DISPLAY:-}"',
+  'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
+  'export DISPLAY="${display:-:1}"',
+  'command -v xclip >/dev/null 2>&1 || { echo "xclip not installed in instance image" >&2; exit 127; }',
+  'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+];
+
+// ---------- 打字借用剪贴板，打完归还 ----------
+// typeInInstance 靠「写容器剪贴板 + Ctrl+V」把文字贴进应用，副作用是容器剪贴板被换成刚打的字，KasmVNC 的无缝剪贴板
+// 还会把它同步到用户本机剪贴板。实测：本机复制一个链接 → 进桌面打「看看」→ 本机、容器剪贴板都成了「看看」→
+// Ctrl+V 贴出「看看」，链接没了；在应用里复制一条消息、打几个字再粘贴也一样。
+// 做法：一轮打字的第一段先把容器剪贴板存下（只存一种最常用的格式：图片 > 文件列表 > 文字，应用私有格式还原不了），
+// 最后一段打完 1 秒后，若剪贴板仍是我们放进去的字就原样放回；这期间用户自己复制了别的，就不动。
+// 经面板按的 Ctrl+V（粘贴桥）会先立刻归还再粘贴；有意写入新内容的粘贴（本机图片 / 本机文字）则直接作废存档。
+const CLIP_DIR = '/tmp/.woc-clip';
+const CLIP_RESTORE_MS = 1000;
+const CLIP_SAVE = `D=${CLIP_DIR}; mkdir -p "$D"
+if [ ! -e "$D/saved.type" ] || [ $(( $(date +%s) - $(stat -c %Y "$D/saved.type") )) -gt 20 ]; then
+  rm -f "$D"/saved.*; ty=none
+  tg=$(timeout 1 xclip -o -selection clipboard -t TARGETS 2>/dev/null || true)
+  for t in image/png text/uri-list x-special/gnome-copied-files UTF8_STRING text/plain STRING; do
+    if printf '%s\\n' "$tg" | grep -qxF "$t"; then ty=$t; break; fi
+  done
+  if [ "$ty" != none ] && ! timeout 2 xclip -o -selection clipboard -t "$ty" > "$D/saved.data" 2>/dev/null; then ty=none; fi
+  echo "$ty" > "$D/saved.type"
+else
+  touch "$D/saved.type"
+fi`;
+const CLIP_RESTORE = `D=${CLIP_DIR}
+[ -e "$D/saved.type" ] || exit 0
+ty=$(cat "$D/saved.type")
+cur=$(timeout 1 xclip -o -selection clipboard -t UTF8_STRING 2>/dev/null || true)
+if [ "$ty" != none ] && [ -e "$D/typed.txt" ] && [ "$cur" = "$(cat "$D/typed.txt")" ]; then
+  xclip -selection clipboard -t "$ty" -i "$D/saved.data" >/dev/null 2>&1
+fi
+rm -f "$D"/saved.* "$D/typed.txt"`;
+const CLIP_DISCARD = `rm -f ${CLIP_DIR}/saved.* ${CLIP_DIR}/typed.txt`;
+
+// 同一实例的剪贴板操作（打字 / 归还 / 粘贴）串行执行，免得归还插在两段打字之间
+const clipChains = new Map<string, Promise<unknown>>();
+function withClipLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const run = (clipChains.get(id) || Promise.resolve()).then(fn, fn);
+  clipChains.set(id, run.catch(() => undefined));
+  return run;
+}
+const clipTimers = new Map<string, ReturnType<typeof setTimeout>>();
+function cancelClipRestore(id: string): boolean {
+  const t = clipTimers.get(id);
+  if (!t) return false;
+  clearTimeout(t);
+  clipTimers.delete(id);
+  return true;
+}
+async function restoreClipboard(inst: Instance): Promise<void> {
+  await execCapture(inst, ['bash', '-c', [...X_PRELUDE, CLIP_RESTORE].join('\n')]).catch(() => {});
+}
+function scheduleClipRestore(inst: Instance): void {
+  cancelClipRestore(inst.id);
+  const t = setTimeout(() => {
+    clipTimers.delete(inst.id);
+    void withClipLock(inst.id, () => restoreClipboard(inst));
+  }, CLIP_RESTORE_MS);
+  t.unref?.();
+  clipTimers.set(inst.id, t);
+}
+
 // 通过 xdotool 在实例容器内输入文字（绕过 VNC keysym 限制，解决中文 IME 吞字问题）。
-// 用 base64 传递文本避免 shell 转义问题，xclip 写入剪贴板后 xdotool 模拟 Ctrl+V 粘贴。
+// 用 base64 传递文本避免 shell 转义问题，xclip 写入剪贴板后 xdotool 模拟 Ctrl+V 粘贴；剪贴板打完归还（见上）。
 export async function typeInInstance(inst: Instance, text: string): Promise<void> {
   const b64 = Buffer.from(text, 'utf8').toString('base64');
   const cmd = [
-    'set -e',
-    'display="${DISPLAY:-}"',
-    'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
-    'export DISPLAY="${display:-:1}"',
-    'command -v xclip >/dev/null 2>&1 || { echo "xclip not installed in instance image" >&2; exit 127; }',
-    'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+    ...X_PRELUDE,
+    CLIP_SAVE,
+    `echo '${b64}' | base64 -d > ${CLIP_DIR}/typed.txt`,
     // xclip -i 会 daemon 化常驻持有剪贴板选区，并继承 exec 的 stdout/stderr；不重定向的话 docker exec
     // 要等这俩 fd 关闭，实测每次卡 ~2s。重定向到 /dev/null 后台后，整条链路从 ~2.1s 降到 ~0.08s。
-    `echo '${b64}' | base64 -d | xclip -selection clipboard -i >/dev/null 2>&1`,
+    `xclip -selection clipboard -i ${CLIP_DIR}/typed.txt >/dev/null 2>&1`,
     'xdotool key --clearmodifiers ctrl+v',
-  ].join('; ');
-  await execCapture(inst, ['bash', '-c', cmd]);
+  ].join('\n');
+  await withClipLock(inst.id, async () => {
+    cancelClipRestore(inst.id);
+    try {
+      await execCapture(inst, ['bash', '-c', cmd]);
+    } finally {
+      scheduleClipRestore(inst);
+    }
+  });
+}
+
+// 把本机剪贴板里的文字粘进应用：粘贴桥判断本机剪贴板比容器的新时走这里（在别处复制后回来直接 Ctrl+V、
+// 局域网 http 下浏览器不同步剪贴板）。与打字不同，这是用户有意换内容，贴完文字就留在容器剪贴板里。
+// 文字可能很长，经文件传入（单个命令行参数有 128KB 上限）。
+export async function pasteTextInInstance(inst: Instance, text: string): Promise<void> {
+  const name = `woc-paste-${Date.now()}.txt`;
+  await withClipLock(inst.id, async () => {
+    cancelClipRestore(inst.id);
+    await docker.getContainer(inst.containerName).putArchive(tarSingleFile(name, Buffer.from(text, 'utf8')), { path: '/tmp' });
+    const cmd = [
+      ...X_PRELUDE,
+      CLIP_DISCARD,
+      `xclip -selection clipboard -i /tmp/${name} >/dev/null 2>&1`,
+      `rm -f /tmp/${name}`,
+      'xdotool key --clearmodifiers ctrl+v',
+    ].join('\n');
+    await execCapture(inst, ['bash', '-c', cmd]);
+  });
 }
 
 // 把本机剪贴板里的图片（截图等）粘进应用（issue #91）：写入容器的 X 剪贴板（目标类型即图片 MIME），
@@ -1506,20 +1598,19 @@ export async function pasteImageInInstance(inst: Instance, mime: string, content
   const ext = PASTE_IMAGE_TYPES[mime];
   if (!ext) throw new Error('不支持的图片类型');
   const name = `woc-paste-${Date.now()}.${ext}`;
-  await docker.getContainer(inst.containerName).putArchive(tarSingleFile(name, content), { path: '/tmp' });
-  const cmd = [
-    'set -e',
-    'display="${DISPLAY:-}"',
-    'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
-    'export DISPLAY="${display:-:1}"',
-    'command -v xclip >/dev/null 2>&1 || { echo "xclip not installed in instance image" >&2; exit 127; }',
-    'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
-    "find /tmp -maxdepth 1 -name 'woc-paste-*' -mmin +10 -delete 2>/dev/null || true",
-    // 同 typeInInstance：xclip 常驻后台持有选区，必须重定向 fd，否则 docker exec 要等它退出（~2s）
-    `xclip -selection clipboard -t ${mime} -i /tmp/${name} >/dev/null 2>&1`,
-    'xdotool key --clearmodifiers ctrl+v',
-  ].join('; ');
-  await execCapture(inst, ['bash', '-c', cmd]);
+  await withClipLock(inst.id, async () => {
+    cancelClipRestore(inst.id); // 有意换成这张图，之前打字借用的剪贴板不再归还
+    await docker.getContainer(inst.containerName).putArchive(tarSingleFile(name, content), { path: '/tmp' });
+    const cmd = [
+      ...X_PRELUDE,
+      CLIP_DISCARD,
+      "find /tmp -maxdepth 1 -name 'woc-paste-*' -mmin +10 -delete 2>/dev/null || true",
+      // 同 typeInInstance：xclip 常驻后台持有选区，必须重定向 fd，否则 docker exec 要等它退出（~2s）
+      `xclip -selection clipboard -t ${mime} -i /tmp/${name} >/dev/null 2>&1`,
+      'xdotool key --clearmodifiers ctrl+v',
+    ].join('\n');
+    await execCapture(inst, ['bash', '-c', cmd]);
+  });
 }
 
 // 通过 xdotool 在实例容器内模拟一次按键（如 Return / BackSpace）。
@@ -1536,7 +1627,15 @@ export async function keyInInstance(inst: Instance, key: string): Promise<void> 
     'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
     `xdotool key --clearmodifiers ${key}`,
   ].join('; ');
-  await execCapture(inst, ['bash', '-c', cmd]);
+  if (!/^ctrl\+v$/i.test(key)) {
+    await execCapture(inst, ['bash', '-c', cmd]);
+    return;
+  }
+  // 粘贴：打字借用的剪贴板若还没归还，先归还再按，免得贴出刚打的字
+  await withClipLock(inst.id, async () => {
+    if (cancelClipRestore(inst.id)) await restoreClipboard(inst);
+    await execCapture(inst, ['bash', '-c', cmd]);
+  });
 }
 
 // ---------- 数据卷管理（仅管理员；路由层用 requireAdmin 限制） ----------

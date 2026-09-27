@@ -68,6 +68,7 @@ import {
   typeInInstance,
   keyInInstance,
   pasteImageInInstance,
+  pasteTextInInstance,
   listOrphanVolumes,
   removeVolume,
   listOrphanContainers,
@@ -983,6 +984,23 @@ app.post('/api/instances/:id/paste-image', { bodyLimit: 64 * 1024 * 1024 }, asyn
     return { ok: true };
   } catch (e: any) {
     return reply.code(400).send({ error: e?.message || '粘贴图片失败' });
+  }
+});
+
+// 本机剪贴板文字粘进应用：粘贴桥判断本机剪贴板比容器的新时走这里（在别处复制后回来直接 Ctrl+V、局域网 http 下
+// 浏览器不同步剪贴板）。与 /type 不同，贴完文字留在容器剪贴板里；长度上限按一次粘贴的合理大小给。
+app.post('/api/instances/:id/paste-text', { bodyLimit: 2 * 1024 * 1024 }, async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const { text } = (req.body as any) ?? {};
+  if (!text || typeof text !== 'string' || text.length > 200_000) return reply.code(400).send({ error: '文字为空或过长' });
+  try {
+    await pasteTextInInstance(findInstance(id)!, text);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '粘贴失败' });
   }
 });
 
