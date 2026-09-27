@@ -476,22 +476,36 @@ export async function describeInstanceVolume(name: string): Promise<string> {
 // 绝不因"本地 :latest 恰好被某次拉取更新过"就悄悄换镜像（那等于一次没人要求的隐式升级；
 // 若本地新镜像恰好是坏的，一次看门狗自愈就能弄坏一个用户从没升级过的实例）。
 // 换镜像只允许发生在显式「升级实例」（不带 keepImage）。
-export async function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
+// 同一实例的重建串行执行：手动重启、看门狗自愈、卡死自愈、升级可能撞在一起，并发时两边都「删旧建新」，
+// 实测同时点两次重启必有一次报「容器名已被占用」失败（运气差时还会删掉另一边刚建好、尚未启动的容器）。
+const lifecycleChains = new Map<string, Promise<unknown>>();
+export function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
+  const run = (lifecycleChains.get(inst.id) || Promise.resolve()).then(
+    () => runInstanceNow(inst, opts),
+    () => runInstanceNow(inst, opts),
+  );
+  lifecycleChains.set(inst.id, run.catch(() => undefined));
+  return run;
+}
+async function runInstanceNow(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
   const net = await ensureNetwork();
-  let imageOverride: string | undefined;
-  try {
-    const existing = docker.getContainer(inst.containerName);
-    const info = await existing.inspect();
-    if (opts?.keepImage && info.Image) imageOverride = String(info.Image);
-    // 删除前先把旧容器最后日志快照进持久日志，否则随容器删除就看不到"上次为何停/崩"。
-    await snapshotContainerLog(inst, '容器重建（重启/升级/自愈），保留上一容器最后日志');
-    await existing.remove({ force: true });
-  } catch {
-    /* 不存在，正常 */
-  }
+  const existing = docker.getContainer(inst.containerName);
+  const info: any = await existing.inspect().catch(() => null);
+  const imageOverride: string | undefined = opts?.keepImage && info?.Image ? String(info.Image) : undefined;
   // 沿用旧镜像重建时无需 ensureImage（镜像 id 一定在本地——容器刚在用它）；
   // 也避免"离线 + 本地无 :latest"时连重启都失败。
+  // 必须先确保目标镜像在本地、再删旧容器：此前先删后拉，升级时拉不到新镜像（面板刚更新、本地只有旧版本号的镜像、
+  // 网络又不通）就会把旧容器删掉却建不出新的，实例直接没了；现在拉取失败时旧容器原样保留。
   if (!imageOverride) await ensureImage();
+  if (info) {
+    try {
+      // 删除前先把旧容器最后日志快照进持久日志，否则随容器删除就看不到"上次为何停/崩"。
+      await snapshotContainerLog(inst, '容器重建（重启/升级/自愈），保留上一容器最后日志');
+      await existing.remove({ force: true });
+    } catch {
+      /* 已被移走，正常 */
+    }
+  }
   await ensureInstanceVolume(inst, imageOverride || WECHAT_IMAGE);
   // 摄像头设备（探测不到则为空数组 → 仅摄像头不可用，音频/麦克风照常）
   const vids = videoDevices();
@@ -597,6 +611,13 @@ export async function upgradeInstance(inst: Instance, opts?: { skipPull?: boolea
       return '';
     }
   })();
+  // 拉取失败、本地的目标镜像又正是实例现在用的：没有可升级的东西，别白白重建（实例会重启一次、所有人断线）
+  if (pullErr && before) {
+    const target = await docker.getImage(WECHAT_IMAGE).inspect().then((i: any) => String(i.Id || '')).catch(() => '');
+    if (target === before) {
+      throw new Error(`拉取新镜像失败（${pullErr?.message || pullErr}），实例未改动（未升级）。请检查网络/镜像源后重试`);
+    }
+  }
   // 升级不改变用户的运行状态：原本停止的实例，升级（重建）后停回去，而不是悄悄拉起。
   const wasStopped = (await instanceRuntime(inst)) === 'stopped';
   await runInstance(inst);
