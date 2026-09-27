@@ -1,5 +1,5 @@
 import { hostname } from 'node:os';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, readPanelLog, filterSince } from './logs.js';
 import http from 'node:http';
 import zlib from 'node:zlib';
@@ -120,34 +120,123 @@ function realisticMac(id: string): string {
 const docker = new Docker(); // 默认连 /var/run/docker.sock
 
 // 面板自身所在的 docker 网络名；新实例都 attach 到它，便于按容器名互访。
-let networkName: string | null = process.env.WOC_DOCKER_NETWORK || null;
+const EXPLICIT_NETWORK = (process.env.WOC_DOCKER_NETWORK || '').trim() || null;
+let networkName: string | null = EXPLICIT_NETWORK;
 
 export type RuntimeState = 'running' | 'stopped' | 'missing';
 
-// 启动时探测面板自身网络（容器内 hostname = 容器短 id）。失败不致命：
-// 退回 WOC_DOCKER_NETWORK 或 null（null 时用 docker 默认 bridge，靠 IP 不靠名字会有问题，故尽量探测成功）。
-export async function ensureNetwork(): Promise<string | null> {
-  if (networkName) return networkName;
-  // 找到「面板自身容器」以读取它所在网络，新建实例就接到同一网络，反代才能按容器名访问到实例。
-  // 候选依次：① 容器 hostname（默认 = 自身短 ID）② 已知面板容器名。
-  // 关键兜底：面板经「一键更新」自更新后，其 hostname 可能被复刻成【旧容器 ID】（已删除），① 会 404，
-  // 这时必须按容器名 ② 找到自己，否则探测失败→新建/重启的实例落到默认 bridge 网络→反代按名访问不到→502 黑屏。
-  const candidates = [hostname(), process.env.WOC_PANEL_CONTAINER || 'woc-panel'];
+// 面板自身容器的完整 ID：docker 把 /etc/hostname、/etc/hosts、/etc/resolv.conf 从
+// <数据目录>/containers/<id>/ 绑定挂进容器，mountinfo 里带着这个 ID，与容器名、hostname 都无关。
+// （podman 的路径是 .../overlay-containers/<id>/userdata/hostname，同样认得出。）
+function selfIdFromMounts(): string | null {
+  try {
+    const m = readFileSync('/proc/self/mountinfo', 'utf8').match(
+      /\/([0-9a-f]{64})\/(?:userdata\/)?(?:hostname|hosts|resolv\.conf) \/etc\//,
+    );
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// 找到「面板自身容器」。新建/重建实例要接到它所在的网络（反代按容器名访问实例），自更新要知道重建哪个容器。
+// 候选依次：① mountinfo 里的容器 ID ② 容器 hostname（默认 = 自身短 ID）③ 已知面板容器名。
+// ② ③ 都会落空的情形：compose 里自定义了 hostname 且容器不叫 woc-panel；或容器被 1Panel/Portainer 之类
+// 工具「重建」时复刻了旧容器的 Hostname（= 已删除的旧容器 ID）。此前只有 ② ③，落空后实例落到默认
+// bridge → 反代按名找不到 → 502 黑屏（#103），① 不受这些影响。
+export async function inspectSelf(): Promise<any | null> {
+  const candidates = [selfIdFromMounts(), hostname(), process.env.WOC_PANEL_CONTAINER || 'woc-panel'];
   for (const cand of candidates) {
     if (!cand) continue;
     try {
-      const info = await docker.getContainer(cand).inspect();
-      const nets = Object.keys(info.NetworkSettings?.Networks || {}).filter((n) => n !== 'none' && n !== 'host');
-      if (nets.length > 0) {
-        networkName = nets[0];
-        return networkName;
-      }
+      return await docker.getContainer(cand).inspect();
     } catch {
       /* 该候选找不到/读不到，尝试下一个 */
     }
   }
+  return null;
+}
+
+// 面板所在的网络（去掉 none/host），按名字排序。
+async function selfNetworks(): Promise<string[] | null> {
+  const self = await inspectSelf();
+  if (!self) return null;
+  return Object.keys(self.NetworkSettings?.Networks || {})
+    .filter((n) => n !== 'none' && n !== 'host')
+    .sort();
+}
+
+// 探测结果只在面板日志里提示一次（ensureNetwork 探测失败时每次建实例都会重试）。
+const networkWarned = new Set<string>();
+function warnNetworkOnce(key: string, msg: string): void {
+  if (networkWarned.has(key)) return;
+  networkWarned.add(key);
+  appendPanelLog('WARN', msg);
+}
+
+// 探测面板自身网络，新建/重建的实例都接到这里。失败不致命：返回 null（实例落到 docker 默认 bridge，
+// 反代按名访问不到，故尽量探测成功；探测不到时可用 WOC_DOCKER_NETWORK 显式指定）。
+export async function ensureNetwork(): Promise<string | null> {
+  if (networkName) return networkName;
+  const nets = await selfNetworks();
+  // 默认 bridge 不支持按容器名解析。面板同时在 bridge 和自定义网络上时必须选自定义网络——旧逻辑取排序后
+  // 第一个，网络名排在 "bridge" 之后（如 proxy、traefik）就会选中 bridge，实例全部 502。
+  const pick = nets?.find((n) => n !== 'bridge') || nets?.[0] || null;
+  if (pick === 'bridge') {
+    warnNetworkOnce(
+      'bridge',
+      '面板在 Docker 默认 bridge 网络上，该网络不能按容器名互访，实例桌面会打不开（502）。' +
+        '请用 docker compose 部署（自带独立网络），或把面板接到自定义网络后重建面板',
+    );
+  }
+  if (pick) {
+    networkName = pick;
+    return networkName;
+  }
   console.warn('[docker] 无法探测面板网络（本地开发或缺少 docker.sock 时正常）');
-  return networkName;
+  warnNetworkOnce(
+    'none',
+    nets
+      ? '面板容器没有可用的 Docker 网络，新建/重启的实例将落到默认 bridge，桌面会打不开（502）'
+      : '找不到面板自身容器，无法确定它所在的 Docker 网络，新建/重启的实例将落到默认 bridge，桌面可能打不开（502）。' +
+          '可在 .env 设 WOC_DOCKER_NETWORK=<面板所在网络名> 后 docker compose up -d',
+  );
+  return null;
+}
+
+// 启动时体检一次（只记日志、不动实例）：① 显式指定的 WOC_DOCKER_NETWORK 面板自己不在上面；
+// ② 运行中的实例和面板不在任何一个共同的自定义网络上（旧版探测失败时建到了 bridge 的实例，#103）。
+// 两者都表现为桌面 502 / 一直重连；② 点「重启」即会把实例重建到面板网络（数据保留）。
+export async function checkInstanceNetworks(instances: Instance[]): Promise<void> {
+  const nets = await selfNetworks();
+  if (!nets) return;
+  if (EXPLICIT_NETWORK && !nets.includes(EXPLICIT_NETWORK)) {
+    warnNetworkOnce(
+      'explicit',
+      `WOC_DOCKER_NETWORK=${EXPLICIT_NETWORK}，但面板自己不在这个网络上（面板所在：${nets.join(', ') || '无'}），` +
+        '实例会接到面板访问不到的网络。请改成面板所在的网络名，或清空它让面板自动探测',
+    );
+  }
+  const shared = new Set(nets.filter((n) => n !== 'bridge'));
+  if (!shared.size) return; // 面板自己就不在自定义网络上：ensureNetwork 已提示
+  const stray: string[] = [];
+  for (const inst of instances) {
+    try {
+      const info: any = await docker.getContainer(inst.containerName).inspect();
+      if (!info.State?.Running) continue;
+      const own = Object.keys(info.NetworkSettings?.Networks || {});
+      if (!own.some((n) => shared.has(n))) stray.push(`「${inst.name}」(${own.join('/') || '无网络'})`);
+    } catch {
+      /* 容器不存在：启动流程会按当前配置新建 */
+    }
+  }
+  if (stray.length) {
+    appendPanelLog(
+      'WARN',
+      `实例${stray.join('、')} 与面板（${[...shared].join(', ')}）不在同一 Docker 网络，面板连不到它们，桌面会打不开。` +
+        '在面板里点这些实例的「重启」即可重建到面板网络（数据保留）',
+    );
+  }
 }
 
 // 摄像头直通：把宿主的 v4l2 视频设备映射进实例容器
@@ -553,7 +642,7 @@ export async function pruneOldWocImages(): Promise<void> {
     const curInstance = await latestInstanceImageId();
     if (curInstance) keep.add(curInstance);
     try {
-      const panelC: any = await docker.getContainer(process.env.WOC_PANEL_CONTAINER || 'woc-panel').inspect();
+      const panelC: any = await inspectSelf();
       if (panelC?.Image) keep.add(String(panelC.Image));
     } catch {
       /* 面板容器名不同/查不到 → 跳过，下面的容器遍历仍会覆盖到 */

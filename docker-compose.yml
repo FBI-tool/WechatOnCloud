@@ -28,6 +28,8 @@ services:
       - WOC_DISABLE_IPV6=${WOC_DISABLE_IPV6:-}
       # 新建实例的数据放到指定的宿主目录（大容量盘 / 方便直接取微信收到的文件），见 .env.example
       - WOC_DATA_ROOT=${WOC_DATA_ROOT:-}
+      # 实例接入的 Docker 网络：默认自动用面板所在的网络（含 1Panel 的 1panel-network 等自定义网络），一般不用填，见 .env.example
+      - WOC_DOCKER_NETWORK=${WOC_DOCKER_NETWORK:-}
       - WOC_INSTANCE_MEM_GB=${WOC_INSTANCE_MEM_GB:-}
       - WOC_INSTANCE_MEM_SOFT_MB=${WOC_INSTANCE_MEM_SOFT_MB:-1500}
       - WOC_INSTANCE_MEM_HARD_MB=${WOC_INSTANCE_MEM_HARD_MB:-2500}

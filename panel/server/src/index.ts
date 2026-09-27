@@ -39,6 +39,8 @@ import {
 } from './store.js';
 import {
   ensureNetwork,
+  checkInstanceNetworks,
+  inspectSelf,
   ensureRunning,
   runInstance,
   stopInstance,
@@ -295,7 +297,8 @@ app.post('/api/admin/version/check', async (req, reply) => {
 app.post('/api/admin/version/self-update', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   try {
-    const { target } = await triggerSelfUpdate();
+    const self = await inspectSelf().catch(() => null);
+    const { target } = await triggerSelfUpdate(self?.Id);
     return { ok: true, target, message: '已开始更新：面板将在十几秒内重启为新版本，请稍候刷新页面' };
   } catch (e: any) {
     appendPanelLog('ERROR', `面板自更新失败：${e?.message || e}`);
@@ -1686,6 +1689,8 @@ for (const pub of listInstances()) {
     app.log.warn(`[instance] 启动实例 ${pub.id} 失败: ${e?.message || e}`);
   }
 }
+// 体检：和面板不在同一网络的实例（旧版探测失败时建到 bridge 的，#103）在面板日志里点名，只提示不动实例
+void checkInstanceNetworks(listInstances()).catch(() => {});
 
 // 启动时清一次旧版本 woc 镜像：面板自更新会留下旧的 woc-panel 镜像（helper 用新镜像重建面板后，
 // 旧镜像不再被任何容器引用，但带 tag 不是 dangling，清不掉）——在这里回收，也作为周期性兜底。

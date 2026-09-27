@@ -121,7 +121,8 @@ async function buildCreateOpts(self: any, imageRef: string): Promise<Docker.Cont
 // 面板侧：拉新镜像 + 派生 helper 容器重建自身。返回目标镜像。
 let updateInFlight = false;
 
-export async function triggerSelfUpdate(): Promise<{ target: string }> {
+// selfRef：面板按容器 ID 认出的自身（见 docker.ts inspectSelf），缺省按容器名 PANEL_NAME 找。
+export async function triggerSelfUpdate(selfRef?: string): Promise<{ target: string }> {
   if (updateInFlight) throw new Error('面板更新已在进行中，请稍候');
   updateInFlight = true;
   // 兜底复位：helper 派生成功但静默失败（如 sock 权限问题）时面板存活、本标志却永远为 true，
@@ -130,15 +131,17 @@ export async function triggerSelfUpdate(): Promise<{ target: string }> {
     updateInFlight = false;
   }, 10 * 60 * 1000).unref();
   try {
-    return await doSelfUpdate();
+    return await doSelfUpdate(selfRef);
   } catch (e) {
     updateInFlight = false; // 失败可重试；成功后面板会被 helper 重建、本进程退出，无需复位
     throw e;
   }
 }
 
-async function doSelfUpdate(): Promise<{ target: string }> {
-  const self: any = await docker.getContainer(PANEL_NAME).inspect();
+async function doSelfUpdate(selfRef?: string): Promise<{ target: string }> {
+  const self: any = await docker.getContainer(selfRef || PANEL_NAME).inspect();
+  // 按面板容器的实际名字重建：容器不叫 woc-panel（自定义 container_name）时，按常量名找不到自己，一键更新直接报错
+  const panelName = String(self.Name || '').replace(/^\//, '') || PANEL_NAME;
   const ref: string = self.Config.Image; // 如 docker.io/gloridust/woc-panel:latest 或 :v1.2.1
   const repo = ref.split('@')[0].replace(/:[^/:]+$/, ''); // 去 tag
   // 版本锚定（架构守则 R1）：优先拉「更新检查」宣告的那个具体版本（CI 打的裸语义化 tag，如 1.3.1），
@@ -162,7 +165,7 @@ async function doSelfUpdate(): Promise<{ target: string }> {
   if (!target) throw lastErr || new Error('拉取面板镜像失败');
   appendPanelLog('INFO', `面板自更新：${target} 已拉取，派生 ${UPDATER_NAME} 容器重建面板（数据保留）`);
 
-  const spec = { panelName: PANEL_NAME, newImage: target, oldImageId: self.Image };
+  const spec = { panelName, newImage: target, oldImageId: self.Image };
   // 仅需 docker.sock；spec 经 env 传入，不依赖 /data 挂载，避免路径不一致。
   const sockBind =
     (self.HostConfig.Binds || []).find((b: string) => b.includes('docker.sock')) || '/var/run/docker.sock:/var/run/docker.sock';
