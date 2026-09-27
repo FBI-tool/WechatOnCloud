@@ -770,6 +770,18 @@ export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
   }
 }
 
+// 实例容器本次已运行多少秒（State.StartedAt 起算）；没在跑 / 读不到时返回 null。
+export async function instanceUptimeSec(inst: Instance): Promise<number | null> {
+  try {
+    const info = await docker.getContainer(inst.containerName).inspect();
+    if (!info.State?.Running) return null;
+    const t = Date.parse(String(info.State.StartedAt || ''));
+    return Number.isFinite(t) ? Math.max(0, (Date.now() - t) / 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
 // 本地「最新实例镜像」的 Id（新建/升级实例会用到的镜像）。查不到（未拉取过）返回 null。
 export async function latestInstanceImageId(): Promise<string | null> {
   try {

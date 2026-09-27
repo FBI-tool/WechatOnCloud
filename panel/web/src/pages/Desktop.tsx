@@ -195,9 +195,10 @@ function humanSize(n: number) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
 }
 
-// KasmVNC/noVNC 客户端 bundle 偶发未捕获异常（实测长时间空闲后报 "Cannot read properties of undefined
-// (reading 'lastActiveAt')"），会弹出其致命错误浮层（#noVNC_fallback_error 加 .noVNC_open）并卡死桌面，
-// 此时底层 ws 已死、自带重连也救不回。返回错误文案以便记日志；无致命错误则返回 null。
+// KasmVNC/noVNC 客户端 bundle 偶发未捕获异常（如断线后报 "Cannot read properties of undefined
+// (reading 'lastActiveAt')"），会弹出其致命错误浮层（#noVNC_fallback_error 加 .noVNC_open）盖住桌面。
+// 非干净断开时底层 ws 已死、noVNC 也不会再自己重连，只能整页重连；干净断开时 noVNC 自带重连仍在进行，
+// 这条报错无害（见 isReconnectGapError）。返回错误文案以便记日志；无致命错误则返回 null。
 //
 // ⚠️ 浏览器扩展误报：KasmVNC 的全局 error / unhandledrejection 处理器会把页面上【任何】未捕获错误都当致命错误
 // 弹浮层——包括浏览器扩展注入到页面主世界的脚本抛的错（MetaMask 等钱包扩展会往每个页面注入 inpage.js，
@@ -225,12 +226,29 @@ function fatalErrorMsg(doc: Document | null | undefined, onExtensionError?: (msg
         onExtensionError?.(msg);
         return null;
       }
+      if (isReconnectGapError(msg, doc)) {
+        el.classList.remove('noVNC_open'); // noVNC 自带重连正在进行 / 已连回，关掉浮层即可（见 isReconnectGapError）
+        box?.replaceChildren();
+        return null;
+      }
       return msg;
     }
   } catch {
     /* 同源正常不会到这 */
   }
   return null;
+}
+
+// KasmVNC 在 iframe 里有个每 5s 的保活定时器，直接读 UI.rfb.lastActiveAt；断线后 UI.rfb 被置空，在 noVNC
+// 自带重连接上之前的空档里它就抛 "Cannot read properties of undefined (reading 'lastActiveAt')" 并弹致命浮层
+// （每次重连还会多叠一个定时器，越往后越容易撞上）。干净断开（服务端关闭、反代超时断开、网络抖一下）后 noVNC
+// 已排好 2s 后自己重连，这条报错无害：若照致命错误整页重载，每次抖动都多一次整页重连，还白白消耗「5 分钟
+// 4 次」的自愈额度，额度用完就只能手动恢复。只有停在 disconnected（非干净断开，noVNC 不会再自己重连）时，
+// 才交给致命自愈整页重连。
+function isReconnectGapError(msg: string, doc: Document | null | undefined): boolean {
+  if (!msg.includes('lastActiveAt')) return false;
+  const c = doc?.documentElement?.classList;
+  return !!c && !c.contains('noVNC_disconnected');
 }
 
 // 错误事件是否来自浏览器扩展注入的脚本（出错文件 / 堆栈里带扩展协议地址）。
@@ -412,6 +430,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const recovering = useRef(false); // 致命崩溃自愈进行中（防错误浮层轮询与 error 事件重复触发重载）
   // 浏览器扩展注入脚本的报错（见 fatalErrorMsg）：只关浮层不重连；每次页面加载只记一条，避免 3s 轮询刷日志
   const extErrLogged = useRef(false);
+  const gapLogged = useRef(false); // 断线重连空档的 lastActiveAt 报错：每次页面加载只记一条
   const onExtensionError = (msg: string) => {
     if (extErrLogged.current || !id) return;
     extErrLogged.current = true;
@@ -762,10 +781,18 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!win) return;
     const onErr = (ev: Event) => {
       if (ev.type === 'error' && ev.target !== win) return; // 捕获阶段也会收到 img 等资源加载失败，与崩溃无关
+      const e = ev as Partial<ErrorEvent> & Partial<PromiseRejectionEvent>;
       if (isExtensionError(ev)) {
         ev.stopImmediatePropagation();
-        const e = ev as Partial<ErrorEvent> & Partial<PromiseRejectionEvent>;
         onExtensionError(String(e.message || e.reason?.message || e.reason || ''));
+        return;
+      }
+      if (isReconnectGapError(String(e.message || e.error?.message || ''), frameRef.current?.contentDocument)) {
+        ev.stopImmediatePropagation(); // 断线重连空档的已知报错：不弹浮层，让 noVNC 自己连回
+        if (!gapLogged.current) {
+          gapLogged.current = true;
+          api.clientLog(id, 'VNC 断线，noVNC 自带重连中（忽略 KasmVNC 重连空档的 lastActiveAt 报错，不整页重载）');
+        }
         return;
       }
       window.setTimeout(() => {

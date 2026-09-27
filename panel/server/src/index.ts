@@ -4,7 +4,7 @@ import fstatic from '@fastify/static';
 import httpProxy from 'http-proxy';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import type { IncomingMessage } from 'node:http';
+import type { ClientRequest, IncomingMessage } from 'node:http';
 import type { Socket } from 'node:net';
 import {
   initStore,
@@ -52,6 +52,7 @@ import {
   resolveInstanceImage,
   removeInstance as removeInstanceContainer,
   instanceRuntime,
+  instanceUptimeSec,
   instanceImageVersion,
   triggerWechat,
   wechatStatus,
@@ -96,7 +97,14 @@ import {
   getFontFamily,
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions, SESSION_TTL_MS } from './sessions.js';
-import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
+import {
+  parseHost,
+  parseAllowedHosts,
+  isRequestHostAllowed,
+  isLoopbackHost,
+  isPrivateIpv4,
+  isPrivateIpv6,
+} from './host-guard.js';
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
@@ -190,9 +198,26 @@ function requireAdmin(req: FastifyRequest, reply: FastifyReply): User | null {
 // ---------- 登录 / 会话 ----------
 // 登录限速：NAS 面板常被直接暴露公网，无限速 = 可被无脑爆破。
 // 双键计数：来源 IP+用户名（5 次/15 分钟）防单账号爆破；来源 IP（20 次/15 分钟）防换用户名轮询。
-// 用 socket 直连地址而非 X-Forwarded-For——trustProxy 开着，XFF 可伪造，直连地址不可伪造
-// （反代场景下直连地址是反代 IP，限速粒度变粗但依然有效兜底）。成功登录清零。纯内存，重启即清。
+// 来源按 loginSource 判定（不用 Fastify 的 req.ip：trustProxy 开着，它取 XFF 最左段，客户端可随意伪造）。
+// 成功登录清零。纯内存，重启即清。
 const loginFails = new Map<string, { n: number; resetAt: number }>();
+
+// 「来源」怎么认：直连面板时就是 socket 对端地址，不可伪造，XFF 一律不信。
+// 经反代访问时对端是反代自己（私网 / 回环地址），按它计数会让所有外网用户共用一个计数——扫描器或某人
+// 输错几次，外网就整体被锁 15 分钟，只能等或重启面板（「外网连不进去、重启容器才好」的一种可能）。
+// 故对端是私网 / 回环且带 X-Forwarded-For 时，按 XFF 最右一段计数：那是紧挨面板的反代追加的来源地址，
+// 客户端伪造的只能排在它左边。另按对端地址做一道放宽的兜底（100 次 / 15 分钟），防止反代配置不当时有人
+// 轮换伪造来源无限试。
+const LOGIN_PROXY_BACKSTOP = 100;
+function loginSource(req: FastifyRequest): { key: string; peer: string; viaProxy: boolean } {
+  const peer = (req.raw.socket?.remoteAddress || '?').replace(/^::ffff:/, '');
+  const fromProxy = isLoopbackHost(peer) || isPrivateIpv4(peer) || isPrivateIpv6(peer);
+  const xff = req.headers['x-forwarded-for'];
+  const hops = (Array.isArray(xff) ? xff.join(',') : xff || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const nearest = hops[hops.length - 1];
+  if (fromProxy && nearest) return { key: nearest, peer, viaProxy: true };
+  return { key: peer, peer, viaProxy: false };
+}
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 function loginFailCheck(key: string, max: number): boolean {
   const e = loginFails.get(key);
@@ -208,10 +233,16 @@ function loginFailBump(key: string): void {
 }
 app.post('/api/auth/login', async (req, reply) => {
   const { username, password } = (req.body as any) ?? {};
-  const ip = req.raw.socket?.remoteAddress || '?';
-  const ipKey = `ip:${ip}`;
-  const userKey = `u:${ip}|${String(username || '')}`;
-  if (!loginFailCheck(ipKey, 20) || !loginFailCheck(userKey, 5)) {
+  const src = loginSource(req);
+  const ip = src.viaProxy ? `${src.key}（经反代 ${src.peer}）` : src.key;
+  const ipKey = `ip:${src.key}`;
+  const userKey = `u:${src.key}|${String(username || '')}`;
+  const peerKey = `peer:${src.peer}`;
+  if (
+    !loginFailCheck(ipKey, 20) ||
+    !loginFailCheck(userKey, 5) ||
+    (src.viaProxy && !loginFailCheck(peerKey, LOGIN_PROXY_BACKSTOP))
+  ) {
     appendPanelLog('WARN', `登录限速触发：来源 ${ip} 尝试登录「${String(username || '')}」被暂时拒绝（15 分钟窗口内失败过多）`);
     return reply.code(429).send({ error: '登录失败次数过多，请 15 分钟后再试' });
   }
@@ -219,6 +250,7 @@ app.post('/api/auth/login', async (req, reply) => {
   if (!u || u.disabled || !verifyPassword(u, password ?? '')) {
     loginFailBump(ipKey);
     loginFailBump(userKey);
+    if (src.viaProxy) loginFailBump(peerKey);
     return reply.code(401).send({ error: '用户名或密码错误' });
   }
   loginFails.delete(ipKey);
@@ -1360,11 +1392,75 @@ function activeVncViewerCount(instId: string): number {
   return activeVncSockets.get(instId)?.size ?? 0;
 }
 
-proxy.on('proxyReq', (proxyReq, req) => {
+// ---------- 实例「卡死」识别 + 自愈（稳定性设计：已知单点） ----------
+// KasmVNC 偶发卡死：静态页照常能出，但 websocket 升级永远等不到 101，noVNC 一直停在「连接中」；或容器
+// I/O/服务 stall，连 noVNC 页面都返回不了（#114「桌面无响应」）。刷新、重启面板都没用，只能等管理员手动
+// 重启实例容器（群里「外网连不进去、要重启容器才能连上」）。原来可选的 HTTP 响应性探测看的是 kclient 出的
+// 静态页，前一种卡死它根本看不到，且周期探测在宿主 CPU/IO 争用时会误判，故默认关着。
+// 这里改用真实用户的请求来判定：上游 UPSTREAM_HANG_MS 内既没回 101、也没回任何响应，就断开这次请求
+// （页面请求回「自动重连」页，别让用户无限转圈），记一次「无应答」；STUCK_WINDOW_MS 内累计 STUCK_HANGS 次、
+// 容器已过预热期、近期没自愈过，才沿用当前镜像重启实例（R10 keepImage）。
+// 不会在预热期误判：实例刚起时 KasmVNC / nginx 还没监听，上游是立刻拒绝（502 / ECONNREFUSED）——那是快速
+// 失败，不是无应答，不计数；健康实例的 101 通常在 100ms 内返回。WOC_STUCK_HEAL=0 可只断开记日志、不自动重启。
+const UPSTREAM_HANG_MS = 25_000;
+const STUCK_HANGS = 2;
+const STUCK_WINDOW_MS = 10 * 60_000;
+const STUCK_MIN_UPTIME_SEC = 180;
+const STUCK_HEAL_COOLDOWN_MS = 15 * 60_000;
+const STUCK_HEAL = process.env.WOC_STUCK_HEAL !== '0';
+const upstreamHangs = new Map<string, number[]>(); // 实例 id → 近期无应答时间戳
+const stuckHealAt = new Map<string, number>();
+const stuckHealing = new Set<string>();
+
+async function onUpstreamHang(instId: string, what: string): Promise<void> {
+  const inst = findInstance(instId);
+  if (!inst) return;
+  const now = Date.now();
+  const hangs = (upstreamHangs.get(instId) || []).filter((t) => now - t < STUCK_WINDOW_MS);
+  hangs.push(now);
+  upstreamHangs.set(instId, hangs);
+  appendInstanceLog(instId, `[vnc] 实例 ${UPSTREAM_HANG_MS / 1000}s 未应答${what}，已断开本次请求（近 10 分钟第 ${hangs.length} 次）`);
+  if (!STUCK_HEAL || hangs.length < STUCK_HANGS || stuckHealing.has(instId) || upgradingIds.has(instId)) return;
+  if (now - (stuckHealAt.get(instId) || 0) < STUCK_HEAL_COOLDOWN_MS) return;
+  const up = await instanceUptimeSec(inst);
+  if (up === null || up < STUCK_MIN_UPTIME_SEC) return; // 没在跑，或刚启动还在预热
+  stuckHealing.add(instId);
+  stuckHealAt.set(instId, now);
+  upstreamHangs.delete(instId);
+  const detail = `桌面连接 10 分钟内 ${hangs.length} 次无应答（KasmVNC 卡死），自动重启实例（数据保留）`;
+  appendInstanceLog(instId, `[vnc] ${detail}`);
+  appendPanelLog('WARN', `实例「${inst.name}」(id=${instId}) ${detail}`);
+  try {
+    await runInstance(inst, { keepImage: true }); // 自愈=重启，幂等：沿用当前镜像，绝不隐式换版
+  } catch (e: any) {
+    appendPanelLog('ERROR', `实例「${inst.name}」(id=${instId}) 卡死自愈重启失败：${e?.message || e}`);
+  } finally {
+    stuckHealing.delete(instId);
+  }
+}
+
+// 盯住一次转发到实例的请求：超时仍无任何响应 → 断开并记一次无应答。closeClient 用于 ws（让客户端别干等）。
+function watchUpstream(proxyReq: ClientRequest, instId: string, what: string, done: NodeJS.EventEmitter, closeClient?: () => void) {
+  const timer = setTimeout(() => {
+    proxyReq.destroy(); // → http-proxy 的 error：页面请求回「自动重连」页
+    closeClient?.();
+    void onUpstreamHang(instId, what);
+  }, UPSTREAM_HANG_MS);
+  const clear = () => clearTimeout(timer);
+  proxyReq.once('response', clear);
+  proxyReq.once('upgrade', clear);
+  proxyReq.once('error', clear);
+  done.once('close', clear); // 客户端先走了（关页 / 自行放弃）
+}
+
+proxy.on('proxyReq', (proxyReq, req, res) => {
   const auth = (req as any)._wocAuth;
   if (auth) proxyReq.setHeader('authorization', auth);
+  // 只盯 noVNC 页面本身：它出不来 = 实例服务卡住。其余资源 / 音频长轮询不计。
+  const instId = (req as any)._wocInstId;
+  if (instId && (req.url || '').startsWith('/vnc/index.html')) watchUpstream(proxyReq, instId, '桌面页面', res);
 });
-proxy.on('proxyReqWs', (proxyReq, req) => {
+proxy.on('proxyReqWs', (proxyReq, req, socket) => {
   const auth = (req as any)._wocAuth;
   if (auth) proxyReq.setHeader('authorization', auth);
   // 上游（实例 nginx → KasmVNC websockify）回 101 = ws 接收器接受了连接，桌面真正连上。
@@ -1375,6 +1471,10 @@ proxy.on('proxyReqWs', (proxyReq, req) => {
       trackActiveVncSocket(instId, req.socket as Socket);
       appendInstanceLog(instId, '[vnc] 上游已接受(101) · 桌面连接建立');
     });
+    // 只盯 VNC 连接本身（/websockify）；音频桥等其它 ws 不计
+    if ((req.url || '').startsWith('/websockify')) {
+      watchUpstream(proxyReq, instId, '桌面连接（websocket 升级）', socket, () => socket.destroy());
+    }
   }
 });
 // 上游（面板→实例）套接字 TCP keepalive：客户端断网/切网（WiFi→4G、NAS 休眠）时 TCP 不会主动通知，
@@ -1461,6 +1561,7 @@ const desktopHandler = (req: FastifyRequest, reply: FastifyReply) => {
   reply.hijack();
   req.raw.url = parsed.rest;
   (req.raw as any)._wocAuth = basicAuth(inst);
+  (req.raw as any)._wocInstId = inst.id;
   proxy.web(req.raw, reply.raw, { target: instanceTarget(inst) });
 };
 
