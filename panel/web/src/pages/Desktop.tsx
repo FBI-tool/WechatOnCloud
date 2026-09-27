@@ -42,7 +42,23 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
     draining = false;
   };
 
+  // 隐藏输入框瘦身：IME 模式下 noVNC 从不清空 noVNC_keyboardinput，每次上屏的字都追加在里面，用得越久越长；
+  // 实测 5 千字时每次合成 ~30ms、8 万字 ~100ms，打字越来越卡（「用着用着」）。noVNC 自己只在「非合成的输入且超过
+  // 200 字」时重置（_keyboardInputReset，连同内部差分基准一起清）。上屏后若已超长，补发一个内容不变的 input 事件
+  // 走它这条路：内容与基准相同、差分为空，不会给应用发任何按键，只触发重置。
+  let composing = false;
+  const trimKeyboardInput = () => {
+    const ki = doc.getElementById('noVNC_keyboardinput') as HTMLTextAreaElement | null;
+    if (composing || !ki || ki.value.length <= 200) return;
+    ki.dispatchEvent(new (win as any).Event('input', { bubbles: true }));
+  };
+  const onCompositionStart = () => {
+    composing = true;
+  };
+
   const onCompositionEnd = (e: Event) => {
+    composing = false;
+    win.setTimeout(trimKeyboardInput, 0); // 等 noVNC 同步完差分基准（它在目标阶段处理 compositionend）
     const txt = (e as CompositionEvent).data;
     if (!txt) return;
     queue.push({ kind: 'text', data: txt });
@@ -105,11 +121,13 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
     ki.style.top = `${Math.round(y)}px`;
   };
 
+  doc.addEventListener('compositionstart', onCompositionStart, true);
   doc.addEventListener('compositionend', onCompositionEnd, true);
   doc.addEventListener('focusin', onFocusIn, true);
   doc.addEventListener('mousedown', onMouseDown, true);
   win.addEventListener('keydown', onKeyDownCapture, true);
   return () => {
+    doc.removeEventListener('compositionstart', onCompositionStart, true);
     doc.removeEventListener('compositionend', onCompositionEnd, true);
     doc.removeEventListener('focusin', onFocusIn, true);
     doc.removeEventListener('mousedown', onMouseDown, true);
