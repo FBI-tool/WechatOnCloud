@@ -52,6 +52,8 @@ services:
       # DNS-rebinding 防护：套 HTTPS 反代部署时把对外域名加进 .env（详见 .env.example）。
       # 默认仅放行 loopback + RFC1918 私网，直连 NAS / 局域网无需改动。
       - PANEL_ALLOWED_HOSTS=${PANEL_ALLOWED_HOSTS:-}
+      # 反代不在本机（比如路由器、另一台机器上的 nginx）时，把它的地址填进来，登录限速才按真实来源计数（见 .env.example）
+      - WOC_TRUSTED_PROXIES=${WOC_TRUSTED_PROXIES:-}
 
     volumes:
       # 面板账号数据（用户、实例元信息、密码哈希）

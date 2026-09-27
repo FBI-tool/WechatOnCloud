@@ -5,6 +5,7 @@ import httpProxy from 'http-proxy';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { BlockList, isIP } from 'node:net';
 import type { ClientRequest, IncomingMessage } from 'node:http';
 import type { Socket } from 'node:net';
 import {
@@ -43,6 +44,7 @@ import {
   checkInstanceNetworks,
   watchInstanceNetwork,
   isFromInstanceNetwork,
+  dockerProxySubnets,
   inspectSelf,
   ensureRunning,
   runInstance,
@@ -110,8 +112,6 @@ import {
   parseAllowedHosts,
   isRequestHostAllowed,
   isLoopbackHost,
-  isPrivateIpv4,
-  isPrivateIpv6,
 } from './host-guard.js';
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
@@ -236,15 +236,41 @@ function requireAdmin(req: FastifyRequest, reply: FastifyReply): User | null {
 const loginFails = new Map<string, { n: number; resetAt: number }>();
 
 // 「来源」怎么认：直连面板时就是 socket 对端地址，不可伪造，XFF 一律不信。
-// 经反代访问时对端是反代自己（私网 / 回环地址），按它计数会让所有外网用户共用一个计数——扫描器或某人
-// 输错几次，外网就整体被锁 15 分钟，只能等或重启面板（「外网连不进去、重启容器才好」的一种可能）。
-// 故对端是私网 / 回环且带 X-Forwarded-For 时，按 XFF 最右一段计数：那是紧挨面板的反代追加的来源地址，
+// 经反代访问时对端是反代自己，按它计数会让所有外网用户共用一个计数——扫描器或某人输错几次，外网就整体
+// 被锁 15 分钟，只能等或重启面板（「外网连不进去、重启容器才好」的一种可能）。
+// 故对端是可信反代且带 X-Forwarded-For 时，按 XFF 最右一段计数：那是紧挨面板的反代追加的来源地址，
 // 客户端伪造的只能排在它左边。另按对端地址做一道放宽的兜底（100 次 / 15 分钟），防止反代配置不当时有人
 // 轮换伪造来源无限试。
+// 可信反代 = 回环 + 本机 Docker 网络里的地址（宿主上的反代经网关进来，容器里的反代在某个 Docker 网络里；
+// 实例专用网络除外）+ WOC_TRUSTED_PROXIES。此前是「任何私网地址」：局域网里随便一台设备都能伪造 XFF，
+// 每次换个来源就绕过 20 次 / 15 分钟的限制，只剩 100 次的兜底。
 const LOGIN_PROXY_BACKSTOP = 100;
-function loginSource(req: FastifyRequest): { key: string; peer: string; viaProxy: boolean } {
+const EXTRA_TRUSTED_PROXIES = (process.env.WOC_TRUSTED_PROXIES || '')
+  .split(/[\s,]+/)
+  .map((x) => x.trim())
+  .filter(Boolean);
+let trustedCache: { list: BlockList; at: number } | null = null;
+async function trustedProxies(): Promise<BlockList> {
+  if (trustedCache && Date.now() - trustedCache.at < 60_000) return trustedCache.list; // 网络会增减，一分钟刷新一次
+  const list = new BlockList();
+  for (const entry of [...(await dockerProxySubnets().catch(() => [] as string[])), ...EXTRA_TRUSTED_PROXIES]) {
+    const [addr, bits] = entry.split('/');
+    const type = isIP(addr) === 6 ? 'ipv6' : isIP(addr) === 4 ? 'ipv4' : null;
+    if (!type) continue;
+    try {
+      if (bits === undefined) list.addAddress(addr, type);
+      else list.addSubnet(addr, Number(bits), type);
+    } catch {
+      /* 写错的条目忽略 */
+    }
+  }
+  trustedCache = { list, at: Date.now() };
+  return list;
+}
+async function loginSource(req: FastifyRequest): Promise<{ key: string; peer: string; viaProxy: boolean }> {
   const peer = (req.raw.socket?.remoteAddress || '?').replace(/^::ffff:/, '');
-  const fromProxy = isLoopbackHost(peer) || isPrivateIpv4(peer) || isPrivateIpv6(peer);
+  const type = isIP(peer) === 6 ? 'ipv6' : 'ipv4';
+  const fromProxy = isLoopbackHost(peer) || (isIP(peer) > 0 && (await trustedProxies()).check(peer, type));
   const xff = req.headers['x-forwarded-for'];
   const hops = (Array.isArray(xff) ? xff.join(',') : xff || '').split(',').map((s) => s.trim()).filter(Boolean);
   const nearest = hops[hops.length - 1];
@@ -266,7 +292,7 @@ function loginFailBump(key: string): void {
 }
 app.post('/api/auth/login', async (req, reply) => {
   const { username, password } = (req.body as any) ?? {};
-  const src = loginSource(req);
+  const src = await loginSource(req);
   const ip = src.viaProxy ? `${src.key}（经反代 ${src.peer}）` : src.key;
   const ipKey = `ip:${src.key}`;
   const userKey = `u:${src.key}|${String(username || '')}`;

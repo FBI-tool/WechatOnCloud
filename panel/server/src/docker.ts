@@ -231,6 +231,31 @@ export function instanceNetworkName(): string | null {
   return isolatedNet ? INSTANCE_NETWORK : null;
 }
 
+// 本机 Docker 网络的网段（登录限速判断「对端是不是反代」用）：宿主上的反代（NAS 自带的反代、frpc）经网关地址进来，
+// 容器里的反代（Nginx Proxy Manager、1Panel 的 OpenResty、cloudflared 等）是某个 Docker 网络里的地址。
+// 实例专用网络只算网关（经宿主转发进来的请求源地址是它）：实例不是反代。
+export async function dockerProxySubnets(): Promise<string[]> {
+  const out: string[] = [];
+  try {
+    const nets: any[] = await docker.listNetworks();
+    for (const n of nets) {
+      for (const c of n?.IPAM?.Config || []) {
+        if (n?.Name === INSTANCE_NETWORK) {
+          if (c?.Gateway) out.push(String(c.Gateway));
+        } else if (c?.Subnet) out.push(String(c.Subnet));
+      }
+    }
+  } catch {
+    // 列不出网络（socket-proxy 没开放网络接口）：退而求其次，只认面板自己所在网络
+    const self = await inspectSelf().catch(() => null);
+    for (const [name, ep] of Object.entries<any>(self?.NetworkSettings?.Networks || {})) {
+      if (ep?.Gateway) out.push(String(ep.Gateway));
+      if (name !== INSTANCE_NETWORK && ep?.IPAddress && ep?.IPPrefixLen) out.push(`${ep.IPAddress}/${ep.IPPrefixLen}`);
+    }
+  }
+  return out;
+}
+
 // 面板容器被外部工具重建（compose up、1Panel / Portainer 的「重建」、飞牛应用更新）后，运行时接上的网络会丢失，
 // 已迁到专用网络的实例就连不上了（502）。启动时 ensureNetwork 会接回去；这里定期复查兜底，
 // 启动时没接上（docker 一时没响应等）的也在这里补接。
