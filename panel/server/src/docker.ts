@@ -122,6 +122,35 @@ function realisticMac(id: string): string {
 
 const docker = new Docker(); // 默认连 /var/run/docker.sock
 
+// 启动时等 Docker 可用。socket-proxy 加固部署下，宿主重启或 compose 同时重建代理和面板时，面板常比代理先起来，
+// 头几秒解析不到 / 连不上代理；不等的话启动流程全部落空：没接上实例专用网络（实例桌面 502，要等之后的定期复查
+// 才补上）、实例镜像解析不到等。直连 docker.sock 时第一下就能连上，不耽误启动。
+export async function waitForDocker(maxMs = 30_000): Promise<boolean> {
+  if (!process.env.DOCKER_HOST && !existsSync('/var/run/docker.sock')) return false; // 本地开发没有 Docker
+  const t0 = Date.now();
+  let lastErr: any;
+  while (Date.now() - t0 < maxMs) {
+    try {
+      await docker.ping();
+    } catch (e: any) {
+      lastErr = e;
+      if (!e?.statusCode) {
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      // 有 HTTP 响应（代理没放行 /_ping 之类）：Docker 是通的
+    }
+    const waited = Date.now() - t0;
+    if (waited > 1500) appendPanelLog('INFO', `等了 ${Math.round(waited / 1000)} 秒才连上 Docker（socket-proxy 刚启动？）`);
+    return true;
+  }
+  appendPanelLog(
+    'ERROR',
+    `${Math.round(maxMs / 1000)} 秒内连不上 Docker（${lastErr?.message || lastErr}），实例相关功能暂不可用；请检查 docker.sock 挂载或 socket-proxy 容器`,
+  );
+  return false;
+}
+
 // 实例接入的 docker 网络名。默认是实例专用网络（见 ensureNetwork）；WOC_DOCKER_NETWORK 显式指定时用指定的。
 const EXPLICIT_NETWORK = (process.env.WOC_DOCKER_NETWORK || '').trim() || null;
 const INSTANCE_NETWORK = (process.env.WOC_INSTANCE_NETWORK || '').trim() || 'woc-instances';
@@ -257,27 +286,34 @@ export async function dockerProxySubnets(): Promise<string[]> {
 }
 
 // 面板容器被外部工具重建（compose up、1Panel / Portainer 的「重建」、飞牛应用更新）后，运行时接上的网络会丢失，
-// 已迁到专用网络的实例就连不上了（502）。启动时 ensureNetwork 会接回去；这里定期复查兜底，
-// 启动时没接上（docker 一时没响应等）的也在这里补接。
+// 已迁到专用网络的实例就连不上了（502）。启动时 ensureNetwork 会接回去；这里定期复查兜底。
+// 启动时 Docker 一直没连上（waitForDocker 等满了）的也在这里补上：没接上的补接；面板重启（不是重建）时网络还在、
+// 但专用网络的网段没读到，拦截实例访问面板的那层防护不生效，也要补。
 export function watchInstanceNetwork(): void {
   if (EXPLICIT_NETWORK) return;
-  setInterval(async () => {
+  const tick = async () => {
     const self = await inspectSelf().catch(() => null);
-    if (!self || netsOf(self).includes(INSTANCE_NETWORK)) return;
+    if (!self) return;
+    const attached = netsOf(self).includes(INSTANCE_NETWORK);
+    if (attached && isolatedNet && networkName === INSTANCE_NETWORK) return;
     const was = networkName === INSTANCE_NETWORK;
     try {
       await attachSelfToInstanceNetwork(self);
       networkName = INSTANCE_NETWORK;
-      appendPanelLog(
-        was ? 'WARN' : 'INFO',
-        was
-          ? `面板不在实例专用网络 ${INSTANCE_NETWORK} 上了（容器被重建过？），已重新接上`
-          : `已接入实例专用网络 ${INSTANCE_NETWORK}，之后新建 / 重启的实例都接到这里`,
-      );
+      if (!attached) {
+        appendPanelLog(
+          was ? 'WARN' : 'INFO',
+          was
+            ? `面板不在实例专用网络 ${INSTANCE_NETWORK} 上了（容器被重建过？），已重新接上`
+            : `已接入实例专用网络 ${INSTANCE_NETWORK}，之后新建 / 重启的实例都接到这里`,
+        );
+      }
     } catch (e: any) {
       if (was) appendPanelLog('ERROR', `面板重新接入实例专用网络 ${INSTANCE_NETWORK} 失败：${e?.message || e}`);
     }
-  }, 2 * 60 * 1000).unref();
+  };
+  setTimeout(() => void tick(), 15_000).unref();
+  setInterval(() => void tick(), 2 * 60 * 1000).unref();
 }
 
 // 新建/重建的实例接到哪个网络。优先实例专用网络；WOC_DOCKER_NETWORK 显式指定时用指定的；
@@ -711,11 +747,20 @@ async function runInstanceNow(inst: Instance, opts?: { keepImage?: boolean }): P
 }
 
 // 确保实例容器在运行：缺失则按需创建（不会重建已有卷），停止则启动。
+// 只有容器确实不存在（404）才新建：Docker 一时连不上（socket-proxy 还没起来）时若也当成「不存在」去重建，
+// 重建那一刻网络多半也没探测到，实例会落到默认 bridge、桌面 502。
 export async function ensureRunning(inst: Instance): Promise<void> {
+  const c = docker.getContainer(inst.containerName);
+  let info: any;
   try {
-    const c = docker.getContainer(inst.containerName);
-    const info = await c.inspect();
-    if (!info.State?.Running) await c.start();
+    info = await c.inspect();
+  } catch (e: any) {
+    if (e?.statusCode !== 404) throw e;
+    return runInstance(inst);
+  }
+  if (info.State?.Running) return;
+  try {
+    await c.start();
   } catch {
     await runInstance(inst);
   }

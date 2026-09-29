@@ -15,6 +15,9 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro  # 代理以只读方式挂载宿主 socket
     environment:
+      # 只监听 IPv4：面板经 Docker 内部网络访问代理，用不到 IPv6。代理默认监听 [::]:2375，宿主关了 IPv6
+      # （内核 ipv6.disable=1）时报 Address family not supported 后反复重启，面板连不上 Docker。
+      DISABLE_IPV6: 1
       # ── 允许项（面板实际使用的端点）──────────────────────────────────
       CONTAINERS: 1   # 容器生命周期（create/start/stop/restart/remove/inspect/logs/stats/archive）
       EXEC: 1         # 必须开启：面板通过 exec 触发应用安装、文件管理、中文输入、设备 ID 重置

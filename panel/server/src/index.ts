@@ -43,6 +43,7 @@ import {
   ensureNetwork,
   checkInstanceNetworks,
   watchInstanceNetwork,
+  waitForDocker,
   isFromInstanceNetwork,
   dockerProxySubnets,
   inspectSelf,
@@ -1871,6 +1872,8 @@ app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) =>
   });
 });
 
+// 下面的启动步骤都要连 Docker：socket-proxy 加固部署下代理可能比面板晚几秒就绪，先等它
+await waitForDocker();
 // 版本兜底：若面板偏好的「同版本实例镜像 tag」不可达则回退 :latest（见 docker.ts）。
 // 须在实例检测/升级/启动之前解析好，否则升级指示器会因指向不存在的 tag 而恒空。
 await resolveInstanceImage().catch(() => {});
