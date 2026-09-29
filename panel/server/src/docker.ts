@@ -200,6 +200,9 @@ async function selfNetworks(): Promise<string[] | null> {
   return self ? netsOf(self) : null;
 }
 
+// socket-proxy 拒绝时 docker 报错里带着它整页的 HTML（多行），写进面板日志前去掉标签、压成一行
+const oneLine = (s: string): string => s.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300);
+
 // 探测结果只在面板日志里提示一次（ensureNetwork 探测失败时每次建实例都会重试）。
 const networkWarned = new Set<string>();
 function warnNetworkOnce(key: string, msg: string): void {
@@ -309,7 +312,7 @@ export function watchInstanceNetwork(): void {
         );
       }
     } catch (e: any) {
-      if (was) appendPanelLog('ERROR', `面板重新接入实例专用网络 ${INSTANCE_NETWORK} 失败：${e?.message || e}`);
+      if (was) appendPanelLog('ERROR', `面板重新接入实例专用网络 ${INSTANCE_NETWORK} 失败：${oneLine(String(e?.message || e))}`);
     }
   };
   setTimeout(() => void tick(), 15_000).unref();
@@ -335,7 +338,7 @@ async function resolveNetwork(): Promise<string | null> {
       const msg = String(e?.message || e);
       warnNetworkOnce(
         'isolation',
-        `没能建立实例专用网络 ${INSTANCE_NETWORK}（${msg}），实例暂时仍接到面板所在的网络、与同网络的其它容器互通。` +
+        `没能建立实例专用网络 ${INSTANCE_NETWORK}（${oneLine(msg)}），实例暂时仍接到面板所在的网络、与同网络的其它容器互通。` +
           (/403|forbidden|denied/i.test(msg) ? '多见于 socket-proxy 加固部署没开放 NETWORKS 权限，见 doc/安全加固.md' : ''),
       );
     }
