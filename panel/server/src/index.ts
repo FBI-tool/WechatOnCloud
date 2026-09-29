@@ -159,7 +159,9 @@ app.addHook('onRequest', async (req, reply) => {
       error: 'Host header not allowed',
       host: parseHost(req.headers.host) || null,
       forwardedHost: req.headers['x-forwarded-host'] || null,
-      hint: '反代部署请把对外域名加入 PANEL_ALLOWED_HOSTS（.env 逗号分隔，支持 *.example.com），改完用 docker compose up -d 重建容器（不是 restart）使其生效',
+      // 要加的是面板收到的 Host：反代原样转发时就是对外域名；反代把 Host 改写成 nas.lan 这类多段内部域名时是它，
+      // 这时加对外域名没用（Host 是多段域名时不看 X-Forwarded-Host，见 host-guard.ts）
+      hint: '反代部署请把上面 host 的值（通常就是对外域名）加入 PANEL_ALLOWED_HOSTS（.env 逗号分隔，支持 *.example.com），改完用 docker compose up -d 重建容器（不是 restart）使其生效',
     });
     return reply; // 显式终止后续生命周期（async 钩子里已 send 时的规范写法，防继续进入路由）
   }
