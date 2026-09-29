@@ -1688,6 +1688,14 @@ export async function snapshotContainerLog(inst: Instance, reason: string): Prom
 }
 
 // 在实例 X 桌面里跑命令的公共开头：定位 DISPLAY，确认镜像里有 xclip / xdotool。
+// 服务端按键一律「先松开 xdotool 自己按住的修饰键，再按」，不用 --clearmodifiers（#151）。
+// --clearmodifiers 会在按键前松开当前按着的修饰键、按完再「恢复」。用户按 Ctrl+V 粘贴时，粘贴桥截下 V、服务端替他按
+// Ctrl+V，这时用户往往还按着 Ctrl：xdotool 按完后用它自己的虚拟键盘（XTEST）把 Ctrl 按回去，而用户松手是从 VNC 键盘
+// 来的，XTEST 这边的 Ctrl 就一直按着。下一次 xdotool 再按 Ctrl 被当成重复按键吞掉，应用收到的是光秃秃的 v——
+// 实测粘完图片接着打中文，发出去的是「v」。先 keyup 一遍既能清掉这种残留（包括旧版本留下的），又不会再按回去。
+const XDO_RELEASE_MODS = 'xdotool keyup Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift';
+const xdoKey = (key: string) => `${XDO_RELEASE_MODS}\nxdotool key ${key}`;
+
 const X_PRELUDE = [
   'set -e',
   'display="${DISPLAY:-}"',
@@ -1767,7 +1775,7 @@ export async function typeInInstance(inst: Instance, text: string): Promise<void
     // xclip -i 会 daemon 化常驻持有剪贴板选区，并继承 exec 的 stdout/stderr；不重定向的话 docker exec
     // 要等这俩 fd 关闭，实测每次卡 ~2s。重定向到 /dev/null 后台后，整条链路从 ~2.1s 降到 ~0.08s。
     `xclip -selection clipboard -i ${CLIP_DIR}/typed.txt >/dev/null 2>&1`,
-    'xdotool key --clearmodifiers ctrl+v',
+    xdoKey('ctrl+v'),
   ].join('\n');
   await withClipLock(inst.id, async () => {
     cancelClipRestore(inst.id);
@@ -1792,7 +1800,7 @@ export async function pasteTextInInstance(inst: Instance, text: string): Promise
       CLIP_DISCARD,
       `xclip -selection clipboard -i /tmp/${name} >/dev/null 2>&1`,
       `rm -f /tmp/${name}`,
-      'xdotool key --clearmodifiers ctrl+v',
+      xdoKey('ctrl+v'),
     ].join('\n');
     await execCapture(inst, ['bash', '-c', cmd]);
   });
@@ -1821,7 +1829,7 @@ export async function pasteImageInInstance(inst: Instance, mime: string, content
       "find /tmp -maxdepth 1 -name 'woc-paste-*' -mmin +10 -delete 2>/dev/null || true",
       // 同 typeInInstance：xclip 常驻后台持有选区，必须重定向 fd，否则 docker exec 要等它退出（~2s）
       `xclip -selection clipboard -t ${mime} -i /tmp/${name} >/dev/null 2>&1`,
-      'xdotool key --clearmodifiers ctrl+v',
+      xdoKey('ctrl+v'),
     ].join('\n');
     await execCapture(inst, ['bash', '-c', cmd]);
   });
@@ -1839,8 +1847,8 @@ export async function keyInInstance(inst: Instance, key: string): Promise<void> 
     'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
     'export DISPLAY="${display:-:1}"',
     'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
-    `xdotool key --clearmodifiers ${key}`,
-  ].join('; ');
+    xdoKey(key),
+  ].join('\n');
   if (!/^ctrl\+v$/i.test(key)) {
     await execCapture(inst, ['bash', '-c', cmd]);
     return;
