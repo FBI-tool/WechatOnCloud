@@ -19,11 +19,12 @@ export interface WechatStatus {
 }
 
 export type RuntimeState = 'running' | 'stopped' | 'missing';
-export type AppType = 'wechat' | 'telegram' | 'chromium' | 'custom';
+export type AppType = 'wechat' | 'telegram' | 'chromium' | 'qq' | 'custom';
 export const APP_LABELS: Record<AppType, string> = {
   wechat: '微信',
   telegram: 'Telegram',
   chromium: 'Chromium',
+  qq: 'QQ',
   custom: '自定义应用',
 };
 
@@ -41,6 +42,7 @@ export const APP_PROFILES: Record<AppType, AppProfile> = {
   wechat: { label: '微信', needsInstall: true, enterHint: '首次进入请扫码登录微信', updateLabel: '更新微信' },
   telegram: { label: 'Telegram', needsInstall: true, enterHint: '首次进入请登录 Telegram', updateLabel: '更新 Telegram' },
   chromium: { label: 'Chromium', needsInstall: false, enterHint: '浏览器已就绪，直接使用即可', updateLabel: '' },
+  qq: { label: 'QQ', needsInstall: true, enterHint: '首次进入请用手机 QQ 扫码登录', updateLabel: '更新 QQ' },
   custom: { label: '自定义应用', needsInstall: true, enterHint: '', updateLabel: '更新' },
 };
 export const appProfile = (t?: AppType): AppProfile => APP_PROFILES[t ?? 'wechat'] ?? APP_PROFILES.wechat;

@@ -1951,6 +1951,7 @@ function CreateUser({ instances, onClose, onDone }: { instances: InstanceWithSta
 const APP_OPTIONS: { type: AppType; desc: string; ready: boolean }[] = [
   { type: 'wechat', desc: '默认', ready: true },
   { type: 'chromium', desc: '浏览器', ready: true },
+  { type: 'qq', desc: '腾讯 QQ', ready: true },
   { type: 'custom', desc: '即将支持', ready: false },
 ];
 
@@ -2014,6 +2015,9 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
         <input className="input" placeholder="实例名称（留空自动命名）" maxLength={30} value={name} onChange={(e) => setName(e.target.value)} />
         {appType === 'chromium' && (
           <div className="muted small">Chromium 浏览器随镜像就绪，创建后直接「进入实例」即可（无需下载安装）。</div>
+        )}
+        {appType === 'qq' && (
+          <div className="muted small">QQ 为腾讯官方 Linux 版，创建后点「下载并安装」从腾讯官方下载（约 180MB）。腾讯只对中国大陆网络开放下载，境外网络会被拒绝。</div>
         )}
         <div className="field-label">允许访问的子账号（管理员默认可访问全部）</div>
         <ChipMultiSelect
